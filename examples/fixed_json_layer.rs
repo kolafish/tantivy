@@ -1,8 +1,13 @@
 use tantivy::schema::{
-    IndexRecordOption, Schema, SchemaBuilder, TextFieldIndexing, TextOptions, Field,
+    self, Field, IndexRecordOption, Schema, SchemaBuilder, TextFieldIndexing, TextOptions,
 };
 use tantivy::tokenizer::{Token, Tokenizer, TokenStream};
-use tantivy::{DateTime, Index, TantivyDocument, Term};
+use tantivy::{
+    schema::{BytesOptions, INDEXED, FAST},
+    DateTime, Index, TantivyDocument, Term,
+};
+use tantivy::query::{BooleanQuery, Occur, Query, TermQuery};
+use tantivy::tokenizer::NgramTokenizer;
 
 pub mod fixed_json_layer {
     use super::*;
@@ -124,483 +129,624 @@ pub mod fixed_json_layer {
         }
     }
 
-    /// 值编码模块 - 用于将数值/日期等类型编码为可按字典序排序的字符串
-    ///
-    /// ## 设计动机
-    ///
-    /// 在 `tantivy` 中，专用的数值字段（如 `f64`, `date`）通过 `Term` 内部的 `set_fast_value`
-    /// 逻辑，将数值转换为保留其大小顺序的大端字节序（`&[u8]`）进行存储和范围查询。
-    /// 这种二进制表示是最高效的，但不一定是合法的 UTF-8 字符串。
-    ///
-    /// 在本实现中，为了在一个字段内同时实现 “路径过滤” 和 “范围查询”，我们将数值/日期字段
-    /// 定义为了 `text` 类型，并使用 `raw` 分词器。这意味着我们必须将 `路径` 和 `值`
-    /// 拼接成一个**单一的、合法的字符串**来作为 `Term`。
-    ///
-    /// ## 实现策略
-    ///
-    /// `value_coder` 的作用就是解决这个问题：
-    /// 1. **借鉴核心思想**: 采用与 `tantivy` 内部相同的位操作逻辑，将 `f64`/`i64` (来自`DateTime`)
-    ///    转换为一个保留原始大小顺序的 `u64`。
-    /// 2. **适配为字符串**: 将这个 `u64` 值编码为一个定长的**十六进制字符串**。十六进制表示法
-    ///    既能完整地代表底层的二进制数据，其字典序也等同于原始数值的顺序，同时它本身是
-    ///    合法的 UTF-8 字符。
-    ///
-    /// 最终，我们可以安全地构建如 `product_price__800533325996fbe5` 这样的字符串，
-    /// 它可以在一个 `text` 字段上通过 `RangeQuery` 进行高效的、带路径的范围查找。
-    mod value_coder {
-        use tantivy::DateTime;
+/// N-gram 分词器，保留路径前缀
+#[derive(Clone)]
+pub struct PathPrefixNgramTokenizer {
+    path_separator: String,
+    ngram_tokenizer: NgramTokenizer,
+}
 
-        /// 将 i64 编码为保持排序性的 u64 (Sign-flipping)
-        fn i64_to_sortable_u64(val: i64) -> u64 {
-            (val as u64) ^ (1u64 << 63)
+impl PathPrefixNgramTokenizer {
+    pub fn new(path_separator: String, min_gram: usize, max_gram: usize) -> Self {
+        Self {
+            path_separator,
+            ngram_tokenizer: NgramTokenizer::new(min_gram, max_gram, false).unwrap(),
         }
+    }
+}
 
-        /// 将 f64 编码为保持排序性的 u64
-        /// 正数: sign bit 设为 1
-        /// 负数: 所有 bit 位取反
-        fn f64_to_sortable_u64(val: f64) -> u64 {
-            let u64_val = val.to_bits();
-            if val >= 0.0 {
-                u64_val | (1u64 << 63)
-            } else {
-                !u64_val
+impl Tokenizer for PathPrefixNgramTokenizer {
+    type TokenStream<'a> = PathPrefixNgramTokenStream;
+
+    fn token_stream<'a>(&mut self, text: &'a str) -> Self::TokenStream<'a> {
+        PathPrefixNgramTokenStream::new(
+            text,
+            &self.path_separator,
+            self.ngram_tokenizer.clone(),
+        )
+    }
+}
+
+/// PathPrefixNgramTokenizer 的 TokenStream
+pub struct PathPrefixNgramTokenStream {
+    tokens: Vec<Token>,
+    current_index: usize,
+}
+
+impl PathPrefixNgramTokenStream {
+    fn new(text: &str, path_separator: &str, mut ngram_tokenizer: NgramTokenizer) -> Self {
+        let mut tokens = Vec::new();
+        let mut position = 0;
+
+        if let Some(last_sep_pos) = text.rfind(path_separator) {
+            let path_prefix = &text[..last_sep_pos + path_separator.len()];
+            let actual_text = &text[last_sep_pos + path_separator.len()..];
+
+            let mut ngram_token_stream = ngram_tokenizer.token_stream(actual_text);
+            while ngram_token_stream.advance() {
+                let ngram_token = ngram_token_stream.token();
+                let prefixed_token_text = format!("{}{}", path_prefix, ngram_token.text);
+                tokens.push(Token {
+                    offset_from: 0,
+                    offset_to: prefixed_token_text.len(),
+                    position,
+                    text: prefixed_token_text,
+                    position_length: 1,
+                });
+                position += 1;
+            }
+        } else {
+            // No separator, just ngram the whole thing (fallback)
+            let mut ngram_token_stream = ngram_tokenizer.token_stream(text);
+            while ngram_token_stream.advance() {
+                let ngram_token = ngram_token_stream.token().clone(); // clone to avoid borrow issues
+                tokens.push(Token {
+                    offset_from: ngram_token.offset_from,
+                    offset_to: ngram_token.offset_to,
+                    position,
+                    text: ngram_token.text,
+                    position_length: 1,
+                });
+                position += 1;
             }
         }
 
-        pub fn encode_f64(val: f64) -> String {
-            format!("{:016x}", f64_to_sortable_u64(val))
-        }
-
-        pub fn encode_date(val: DateTime) -> String {
-            let i64_val = val.into_timestamp_micros();
-            format!("{:016x}", i64_to_sortable_u64(i64_val))
+        Self {
+            tokens,
+            current_index: 0,
         }
     }
+}
 
-    /// 优化版 JSON 处理层 - 扁平结构 + 自定义分词器 + 磁盘持久化
-    #[derive(Clone)]
-    pub struct FixedJsonLayer {
-        text_analyzed_field: Field, // 分词文本字段（使用自定义分词器）
-        text_raw_field: Field,      // 原始文本字段（raw分词器）
-        number_field: Field,        // 数值字段
-        date_field: Field,          // 日期字段
-        schema: Schema,
-        config: JsonLayerConfig,
-        path_tokenizer: PathPrefixTokenizer, // 自定义路径前缀分词器
-    }
-
-    /// 配置
-    #[derive(Clone)]
-    pub struct JsonLayerConfig {
-        pub path_separator: String,
-        pub text_classification_rules: TextClassificationRules,
-    }
-
-    /// 简化版文本分类规则
-    #[derive(Clone)]
-    pub struct TextClassificationRules {
-        pub identifier_patterns: Vec<regex::Regex>,
-    }
-
-    impl Default for JsonLayerConfig {
-        fn default() -> Self {
-            Self {
-                path_separator: "__".to_string(),
-                text_classification_rules: TextClassificationRules::default(),
-            }
+impl TokenStream for PathPrefixNgramTokenStream {
+    fn advance(&mut self) -> bool {
+        if self.current_index < self.tokens.len() {
+            self.current_index += 1;
+            true
+        } else {
+            false
         }
     }
 
-    impl Default for TextClassificationRules {
-        fn default() -> Self {
-            Self {
-                identifier_patterns: vec![
-                    regex::Regex::new(r"^[A-Z0-9]{6,}$").unwrap(), // 大写ID
-                    regex::Regex::new(r"^[a-z0-9]+@[a-z0-9]+\.[a-z]+$").unwrap(), // 邮箱地址
-                    regex::Regex::new(r"^[A-Z]{2,3}[0-9]{6,}$").unwrap(), // 产品SKU格式
-                ],
-            }
+    fn token(&self) -> &Token {
+        &self.tokens[self.current_index - 1]
+    }
+
+    fn token_mut(&mut self) -> &mut Token {
+        &mut self.tokens[self.current_index - 1]
+    }
+}
+
+/// 值编码模块 - 用于将数值/日期等类型编码为可按字典序排序的字符串
+///
+/// ## 设计动机
+///
+/// 在 `tantivy` 中，专用的数值字段（如 `f64`, `date`）通过 `Term` 内部的 `set_fast_value`
+/// 逻辑，将数值转换为保留其大小顺序的大端字节序（`&[u8]`）进行存储和范围查询。
+/// 这种二进制表示是最高效的，但不一定是合法的 UTF-8 字符串。
+///
+/// 在本实现中，为了在一个字段内同时实现 “路径过滤” 和 “范围查询”，我们将数值/日期字段
+/// 定义为了 `text` 类型，并使用 `raw` 分词器。这意味着我们必须将 `路径` 和 `值`
+/// 拼接成一个**单一的、合法的字符串**来作为 `Term`。
+///
+/// ## 实现策略
+///
+/// `value_coder` 的作用就是解决这个问题：
+/// 1. **借鉴核心思想**: 采用与 `tantivy` 内部相同的位操作逻辑，将 `f64`/`i64` (来自`DateTime`)
+///    转换为一个保留原始大小顺序的 `u64`。
+/// 2. **适配为字符串**: 将这个 `u64` 值编码为一个定长的**十六进制字符串**。十六进制表示法
+///    既能完整地代表底层的二进制数据，其字典序也等同于原始数值的顺序，同时它本身是
+///    合法的 UTF-8 字符。
+///
+/// 最终，我们可以安全地构建如 `product_price__800533325996fbe5` 这样的字符串，
+/// 它可以在一个 `text` 字段上通过 `RangeQuery` 进行高效的、带路径的范围查找。
+mod value_coder {
+    use tantivy::DateTime;
+
+    /// 将 i64 编码为保持排序性的 u64 (Sign-flipping)
+    fn i64_to_sortable_u64(val: i64) -> u64 {
+        (val as u64) ^ (1u64 << 63)
+    }
+
+    /// 将 f64 编码为保持排序性的 u64
+    /// 正数: sign bit 设为 1
+    /// 负数: 所有 bit 位取反
+    fn f64_to_sortable_u64(val: f64) -> u64 {
+        let u64_val = val.to_bits();
+        if val >= 0.0 {
+            u64_val | (1u64 << 63)
+        } else {
+            !u64_val
         }
     }
 
-    /// 文本类型分类
-    #[derive(Debug, Clone)]
-    enum TextType {
-        AnalyzedText, // 需要分词的文本
-        Keyword,      // 短关键词
-        Identifier,   // 标识符
+    pub fn encode_f64(val: f64) -> String {
+        format!("{:016x}", f64_to_sortable_u64(val))
     }
 
-    impl FixedJsonLayer {
-        pub fn new() -> tantivy::Result<Self> {
-            Self::new_with_config(JsonLayerConfig::default())
+    pub fn encode_date(val: DateTime) -> String {
+        let i64_val = val.into_timestamp_micros();
+        format!("{:016x}", i64_to_sortable_u64(i64_val))
+    }
+}
+
+/// 优化版 JSON 处理层 - 扁平结构 + 自定义分词器 + 磁盘持久化
+#[derive(Clone)]
+pub struct FixedJsonLayer {
+    text_analyzed_field: Field, // 分词文本字段（使用自定义分词器）
+    text_raw_field: Field,      // 原始文本字段（raw分词器）
+    text_ngram_field: Field,    // N-gram 字段，用于部分匹配
+    number_field: Field,        // 数值字段
+    date_field: Field,          // 日期字段
+    schema: Schema,
+    config: JsonLayerConfig,
+    path_tokenizer: PathPrefixTokenizer, // 自定义路径前缀分词器
+}
+
+/// 配置
+#[derive(Clone)]
+pub struct JsonLayerConfig {
+    pub path_separator: String,
+    pub text_classification_rules: TextClassificationRules,
+}
+
+/// 简化版文本分类规则
+#[derive(Clone)]
+pub struct TextClassificationRules {
+    pub identifier_patterns: Vec<regex::Regex>,
+}
+
+impl Default for JsonLayerConfig {
+    fn default() -> Self {
+        Self {
+            path_separator: "__".to_string(),
+            text_classification_rules: TextClassificationRules::default(),
         }
+    }
+}
 
-        pub fn new_with_config(config: JsonLayerConfig) -> tantivy::Result<Self> {
-            let mut schema_builder = SchemaBuilder::new();
+impl Default for TextClassificationRules {
+    fn default() -> Self {
+        Self {
+            identifier_patterns: vec![
+                regex::Regex::new(r"^[A-Z0-9]{6,}$").unwrap(), // 大写ID
+                regex::Regex::new(r"^[a-z0-9]+@[a-z0-9]+\.[a-z]+$").unwrap(), // 邮箱地址
+                regex::Regex::new(r"^[A-Z]{2,3}[0-9]{6,}$").unwrap(), // 产品SKU格式
+            ],
+        }
+    }
+}
 
-            // 使用自定义分词器名称
-            let text_analyzed_field = schema_builder.add_text_field(
-                "json_text_analyzed",
-                TextOptions::default()
-                    .set_indexing_options(
-                        TextFieldIndexing::default()
-                            .set_tokenizer("path_prefix") // 使用自定义分词器！
-                            .set_index_option(IndexRecordOption::Basic),
-                    )
-                    .set_stored(),
-            );
+/// 文本类型分类
+#[derive(Debug, Clone)]
+enum TextType {
+    AnalyzedText, // 需要分词的文本
+    Keyword,      // 短关键词
+    Identifier,   // 标识符
+}
 
-            let text_raw_field = schema_builder.add_text_field(
-                "json_text_raw",
-                TextOptions::default()
-                    .set_indexing_options(
-                        TextFieldIndexing::default()
-                            .set_tokenizer("raw")
-                            .set_index_option(IndexRecordOption::Basic),
-                    )
-                    .set_stored(),
-            );
+impl FixedJsonLayer {
+    pub fn new() -> tantivy::Result<Self> {
+        Self::new_with_config(JsonLayerConfig::default())
+    }
 
-            // 将 number_field 和 date_field 定义为 text 字段，使用 raw 分词器
-            // 以便存储 `path + encoded_value` 并支持范围查询
-            let number_field = schema_builder.add_text_field(
-                "json_number",
-                TextOptions::default().set_indexing_options(
+    pub fn new_with_config(config: JsonLayerConfig) -> tantivy::Result<Self> {
+        let mut schema_builder = SchemaBuilder::new();
+
+        // 使用自定义分词器名称
+        let text_analyzed_field = schema_builder.add_text_field(
+            "json_text_analyzed",
+            TextOptions::default()
+                .set_indexing_options(
+                    TextFieldIndexing::default()
+                        .set_tokenizer("path_prefix") // 使用自定义分词器！
+                        .set_index_option(IndexRecordOption::Basic),
+                )
+                .set_stored(),
+        );
+
+        let text_raw_field = schema_builder.add_text_field(
+            "json_text_raw",
+            TextOptions::default()
+                .set_indexing_options(
                     TextFieldIndexing::default()
                         .set_tokenizer("raw")
                         .set_index_option(IndexRecordOption::Basic),
-                ),
-            );
+                )
+                .set_stored(),
+        );
 
-            let date_field = schema_builder.add_text_field(
-                "json_date",
-                TextOptions::default().set_indexing_options(
-                    TextFieldIndexing::default()
-                        .set_tokenizer("raw")
-                        .set_index_option(IndexRecordOption::Basic),
-                ),
-            );
+        // N-gram 字段
+        let text_ngram_field = schema_builder.add_text_field(
+            "json_text_ngram",
+            TextOptions::default().set_indexing_options(
+                TextFieldIndexing::default()
+                    .set_tokenizer("path_prefix_ngram")
+                    .set_index_option(IndexRecordOption::Basic),
+            ),
+        );
 
-            let schema = schema_builder.build();
+        // 将 number_field 和 date_field 定义为 text 字段，使用 raw 分词器
+        // 以便存储 `path + encoded_value` 并支持范围查询
+        let number_field = schema_builder.add_bytes_field(
+            "json_number",
+            BytesOptions::default().set_indexed().set_fast(),
+        );
+        let date_field = schema_builder.add_bytes_field(
+            "json_date",
+            BytesOptions::default().set_indexed().set_fast(),
+        );
 
-            let path_tokenizer = PathPrefixTokenizer::new(config.path_separator.clone());
+        let schema = schema_builder.build();
 
-            Ok(FixedJsonLayer {
-                text_analyzed_field,
-                text_raw_field,
-                number_field,
-                date_field,
-                schema,
-                config,
-                path_tokenizer,
-            })
+        let path_tokenizer = PathPrefixTokenizer::new(config.path_separator.clone());
+
+        Ok(FixedJsonLayer {
+            text_analyzed_field,
+            text_raw_field,
+            text_ngram_field,
+            number_field,
+            date_field,
+            schema,
+            config,
+            path_tokenizer,
+        })
+    }
+
+    /// 创建或打开磁盘索引
+    pub fn create_or_open_index<P: AsRef<Path>>(
+        &self,
+        index_path: P,
+    ) -> tantivy::Result<Index> {
+        let index_path = index_path.as_ref();
+
+        let index = if index_path.exists() {
+            // 打开现有索引
+            println!("📂 Opening existing index at: {:?}", index_path);
+            Index::open_in_dir(index_path)?
+        } else {
+            // 创建新索引
+            println!("🆕 Creating new index at: {:?}", index_path);
+            std::fs::create_dir_all(index_path)?;
+            Index::create_in_dir(index_path, self.schema.clone())?
+        };
+
+        // 注册自定义分词器
+        let tokenizers = index.tokenizers();
+        tokenizers.register(
+            "path_prefix",
+            PathPrefixTokenizer::new(self.config.path_separator.clone()),
+        );
+        // 注册 n-gram 分词器 (min=2, max=3)
+        tokenizers.register(
+            "path_prefix_ngram",
+            PathPrefixNgramTokenizer::new(self.config.path_separator.clone(), 2, 3),
+        );
+
+        Ok(index)
+    }
+
+    pub fn schema(&self) -> &Schema {
+        &self.schema
+    }
+
+    /// 处理扁平 JSON 对象（不支持嵌套）
+    pub fn process_flat_json_object(
+        &self,
+        json_obj: &Map<String, Value>,
+    ) -> tantivy::Result<TantivyDocument> {
+        let mut doc = TantivyDocument::new();
+
+        for (key, value) in json_obj {
+            self.add_flat_value(&mut doc, key, value);
         }
 
-        /// 创建或打开磁盘索引
-        pub fn create_or_open_index<P: AsRef<Path>>(
-            &self,
-            index_path: P,
-        ) -> tantivy::Result<Index> {
-            let index_path = index_path.as_ref();
+        Ok(doc)
+    }
 
-            let index = if index_path.exists() {
-                // 打开现有索引
-                println!("📂 Opening existing index at: {:?}", index_path);
-                Index::open_in_dir(index_path)?
-            } else {
-                // 创建新索引
-                println!("🆕 Creating new index at: {:?}", index_path);
-                std::fs::create_dir_all(index_path)?;
-                Index::create_in_dir(index_path, self.schema.clone())?
-            };
-
-            // 注册自定义分词器
-            index.tokenizers().register(
-                "path_prefix",
-                PathPrefixTokenizer::new(self.config.path_separator.clone()),
-            );
-
-            Ok(index)
-        }
-
-        pub fn schema(&self) -> &Schema {
-            &self.schema
-        }
-
-        /// 处理扁平 JSON 对象（不支持嵌套）
-        pub fn process_flat_json_object(
-            &self,
-            json_obj: &Map<String, Value>,
-        ) -> tantivy::Result<TantivyDocument> {
-            let mut doc = TantivyDocument::new();
-
-            for (key, value) in json_obj {
-                self.add_flat_value(&mut doc, key, value);
-            }
-
-            Ok(doc)
-        }
-
-        /// 添加扁平JSON值（处理数组和基本类型）
-        fn add_flat_value(&self, doc: &mut TantivyDocument, field_name: &str, value: &Value) {
-            match value {
-                Value::String(s) => {
-                    // 尝试解析为日期，失败则作为文本处理
-                    if let Some(date_time) = self.try_parse_date(s) {
-                        self.add_date_value(doc, field_name, date_time);
-                    } else {
-                        let text_type = self.classify_text(s);
-                        self.add_text_value(doc, field_name, s, text_type);
-                    }
-                }
-                Value::Number(n) => {
-                    if let Some(f) = n.as_f64() {
-                        self.add_number_value(doc, field_name, f);
-                    }
-                }
-                Value::Bool(b) => {
-                    self.add_bool_value(doc, field_name, *b);
-                }
-                Value::Array(arr) => {
-                    // 处理数组：为每个元素添加相同的字段名
-                    for item in arr {
-                        self.add_flat_value(doc, field_name, item);
-                    }
-                }
-                _ => {
-                    // 忽略 null 和其他类型
-                }
-            }
-        }
-
-        /// 尝试解析日期字符串
-        fn try_parse_date(&self, s: &str) -> Option<DateTime> {
-            if s.len() < 8 {
-                return None;
-            }
-            // 检查是否包含日期格式的基本特征
-            let has_date_chars = s.contains('-') || s.contains('T') || s.contains(':');
-            if !has_date_chars {
-                return None;
-            }
-            self.parse_date_formats(s)
-        }
-
-        /// 解析多种日期格式
-        fn parse_date_formats(&self, s: &str) -> Option<DateTime> {
-            use time::{Date, PrimitiveDateTime, Time};
-            if let Ok(dt) =
-                time::OffsetDateTime::parse(s, &time::format_description::well_known::Iso8601::DEFAULT)
-            {
-                return Some(DateTime::from_utc(dt));
-            }
-            if let Ok(dt) =
-                PrimitiveDateTime::parse(s, &time::format_description::well_known::Iso8601::DEFAULT)
-            {
-                let offset_dt = dt.assume_utc();
-                return Some(DateTime::from_utc(offset_dt));
-            }
-            if s.len() == 10 && s.matches('-').count() == 2 {
-                if let Ok(date) =
-                    Date::parse(s, &time::format_description::parse("[year]-[month]-[day]").unwrap())
-                {
-                    let dt = PrimitiveDateTime::new(date, Time::MIDNIGHT);
-                    return Some(DateTime::from_utc(dt.assume_utc()));
+    /// 添加扁平JSON值（处理数组和基本类型）
+    fn add_flat_value(&self, doc: &mut TantivyDocument, field_name: &str, value: &Value) {
+        match value {
+            Value::String(s) => {
+                // 尝试解析为日期，失败则作为文本处理
+                if let Some(date_time) = self.try_parse_date(s) {
+                    self.add_date_value(doc, field_name, date_time);
+                } else {
+                    let text_type = self.classify_text(s);
+                    self.add_text_value(doc, field_name, s, text_type);
                 }
             }
-            None
-        }
-
-        /// 添加日期值
-        fn add_date_value(&self, doc: &mut TantivyDocument, field_name: &str, date_time: DateTime) {
-            let encoded_date = value_coder::encode_date(date_time);
-            let path_value =
-                format!("{}{}{}", field_name, self.config.path_separator, encoded_date);
-            doc.add_text(self.date_field, &path_value);
-        }
-
-        /// 简化的文本分类
-        fn classify_text(&self, text: &str) -> TextType {
-            for pattern in &self.config.text_classification_rules.identifier_patterns {
-                if pattern.is_match(text) {
-                    return TextType::Identifier;
+            Value::Number(n) => {
+                if let Some(f) = n.as_f64() {
+                    self.add_number_value(doc, field_name, f);
                 }
             }
-            if self.has_whitespace_or_punctuation(text) {
-                TextType::AnalyzedText
-            } else {
-                TextType::Keyword
+            Value::Bool(b) => {
+                self.add_bool_value(doc, field_name, *b);
             }
-        }
-
-        /// 检查文本是否包含空格或标点符号
-        fn has_whitespace_or_punctuation(&self, text: &str) -> bool {
-            text.chars()
-                .any(|c| c.is_whitespace() || c.is_ascii_punctuation() || !c.is_alphanumeric())
-        }
-
-        /// 添加文本值 - 智能分词策略
-        fn add_text_value(
-            &self,
-            doc: &mut TantivyDocument,
-            path: &str,
-            value: &str,
-            text_type: TextType,
-        ) {
-            let prefixed_value = format!("{}{}{}", path, self.config.path_separator, value);
-
-            match text_type {
-                TextType::AnalyzedText => {
-                    doc.add_text(self.text_raw_field, &prefixed_value);
-                    let tokens = self
-                        .path_tokenizer
-                        .clone()
-                        .tokenize_to_strings(&prefixed_value);
-                    for token in tokens {
-                        doc.add_text(self.text_analyzed_field, &token);
-                    }
-                }
-                TextType::Keyword | TextType::Identifier => {
-                    doc.add_text(self.text_raw_field, &prefixed_value);
+            Value::Array(arr) => {
+                // 处理数组：为每个元素添加相同的字段名
+                for item in arr {
+                    self.add_flat_value(doc, field_name, item);
                 }
             }
-        }
-
-        /// 添加数值
-        fn add_number_value(&self, doc: &mut TantivyDocument, path: &str, value: f64) {
-            let encoded_num = value_coder::encode_f64(value);
-            let path_value = format!("{}{}{}", path, self.config.path_separator, encoded_num);
-            doc.add_text(self.number_field, &path_value);
-        }
-
-        /// 添加布尔值
-        fn add_bool_value(&self, doc: &mut TantivyDocument, path: &str, value: bool) {
-            let path_value = format!("{}{}{}", path, self.config.path_separator, value);
-            doc.add_text(self.text_raw_field, &path_value);
+            _ => {
+                // 忽略 null 和其他类型
+            }
         }
     }
 
-    /// 智能查询构建器
-    pub struct SmartJsonQueryBuilder {
-        layer: FixedJsonLayer,
+    /// 尝试解析日期字符串
+    fn try_parse_date(&self, s: &str) -> Option<DateTime> {
+        if s.len() < 8 {
+            return None;
+        }
+        // 检查是否包含日期格式的基本特征
+        let has_date_chars = s.contains('-') || s.contains('T') || s.contains(':');
+        if !has_date_chars {
+            return None;
+        }
+        self.parse_date_formats(s)
     }
 
-    impl SmartJsonQueryBuilder {
-        pub fn new(layer: FixedJsonLayer) -> Self {
-            Self { layer }
+    /// 解析多种日期格式
+    fn parse_date_formats(&self, s: &str) -> Option<DateTime> {
+        use time::{Date, PrimitiveDateTime, Time};
+        if let Ok(dt) =
+            time::OffsetDateTime::parse(s, &time::format_description::well_known::Iso8601::DEFAULT)
+        {
+            return Some(DateTime::from_utc(dt));
+        }
+        if let Ok(dt) =
+            PrimitiveDateTime::parse(s, &time::format_description::well_known::Iso8601::DEFAULT)
+        {
+            let offset_dt = dt.assume_utc();
+            return Some(DateTime::from_utc(offset_dt));
+        }
+        if s.len() == 10 && s.matches('-').count() == 2 {
+            if let Ok(date) =
+                Date::parse(s, &time::format_description::parse("[year]-[month]-[day]").unwrap())
+            {
+                let dt = PrimitiveDateTime::new(date, Time::MIDNIGHT);
+                return Some(DateTime::from_utc(dt.assume_utc()));
+            }
+        }
+        None
+    }
+
+    /// 添加日期值
+    fn add_date_value(&self, doc: &mut TantivyDocument, field_name: &str, date_time: DateTime) {
+        let encoded_date = value_coder::encode_date(date_time);
+        let path_value =
+            format!("{}{}{}", field_name, self.config.path_separator, encoded_date);
+        doc.add_bytes(self.date_field, path_value.as_bytes());
+    }
+
+    /// 简化的文本分类
+    fn classify_text(&self, text: &str) -> TextType {
+        for pattern in &self.config.text_classification_rules.identifier_patterns {
+            if pattern.is_match(text) {
+                return TextType::Identifier;
+            }
+        }
+        if self.has_whitespace_or_punctuation(text) {
+            TextType::AnalyzedText
+        } else {
+            TextType::Keyword
+        }
+    }
+
+    /// 检查文本是否包含空格或标点符号
+    fn has_whitespace_or_punctuation(&self, text: &str) -> bool {
+        text.chars()
+            .any(|c| c.is_whitespace() || c.is_ascii_punctuation() || !c.is_alphanumeric())
+    }
+
+    /// 添加文本值 - 智能分词策略
+    fn add_text_value(
+        &self,
+        doc: &mut TantivyDocument,
+        path: &str,
+        value: &str,
+        text_type: TextType,
+    ) {
+        let prefixed_value = format!("{}{}{}", path, self.config.path_separator, value);
+
+        match text_type {
+            TextType::AnalyzedText => {
+                doc.add_text(self.text_raw_field, &prefixed_value);
+                let tokens = self
+                    .path_tokenizer
+                    .clone()
+                    .tokenize_to_strings(&prefixed_value);
+                for token in tokens {
+                    doc.add_text(self.text_analyzed_field, &token);
+                }
+                // 为可分析文本添加带路径的 n-gram 索引
+                doc.add_text(self.text_ngram_field, &prefixed_value);
+            }
+            TextType::Keyword | TextType::Identifier => {
+                doc.add_text(self.text_raw_field, &prefixed_value);
+            }
+        }
+    }
+
+    /// 添加数值
+    fn add_number_value(&self, doc: &mut TantivyDocument, path: &str, value: f64) {
+        let encoded_num = value_coder::encode_f64(value);
+        let path_value = format!("{}{}{}", path, self.config.path_separator, encoded_num);
+        doc.add_bytes(self.number_field, path_value.as_bytes());
+    }
+
+    /// 添加布尔值
+    fn add_bool_value(&self, doc: &mut TantivyDocument, path: &str, value: bool) {
+        let path_value = format!("{}{}{}", path, self.config.path_separator, value);
+        doc.add_text(self.text_raw_field, &path_value);
+    }
+}
+
+/// 智能查询构建器
+pub struct SmartJsonQueryBuilder {
+    layer: FixedJsonLayer,
+}
+
+impl SmartJsonQueryBuilder {
+    pub fn new(layer: FixedJsonLayer) -> Self {
+        Self { layer }
+    }
+
+    /// 智能查询: 对查询词分词，并同时搜索原文和词元
+    pub fn smart_query(
+        &self,
+        path: &str,
+        value: &str,
+    ) -> tantivy::Result<Box<dyn tantivy::query::Query>> {
+        let mut subqueries: Vec<(Occur, Box<dyn Query>)> = Vec::new();
+
+        // 1. 原始字段查询（精确匹配整个查询字符串）
+        let prefixed_value = format!("{}{}{}", path, self.layer.config.path_separator, value);
+        let raw_term = Term::from_field_text(self.layer.text_raw_field, &prefixed_value);
+        subqueries.push((
+            Occur::Should,
+            Box::new(TermQuery::new(raw_term, IndexRecordOption::Basic)),
+        ));
+
+        // 2. 分词字段查询 (AND查询，要求所有词元都存在)
+        let mut tokenizer = self.layer.path_tokenizer.clone();
+        let tokens = tokenizer.tokenize_to_strings(&prefixed_value);
+
+        // 只有当分词结果多于一个，或者单个分词与原始值不同时，才进行分词查询
+        if tokens.len() > 1 || (tokens.len() == 1 && tokens[0] != prefixed_value) {
+            let mut token_queries = Vec::new();
+            for token_str in tokens {
+                let term = Term::from_field_text(self.layer.text_analyzed_field, &token_str);
+                token_queries.push((
+                    Occur::Must,
+                    Box::new(TermQuery::new(term, IndexRecordOption::Basic)) as Box<dyn Query>,
+                ));
+            }
+            if !token_queries.is_empty() {
+                subqueries.push((Occur::Should, Box::new(BooleanQuery::new(token_queries))));
+            }
         }
 
-        /// 智能查询: 对查询词分词，并同时搜索原文和词元
-        pub fn smart_query(
-            &self,
-            path: &str,
-            value: &str,
-        ) -> tantivy::Result<Box<dyn tantivy::query::Query>> {
-            let mut subqueries: Vec<(Occur, Box<dyn Query>)> = Vec::new();
+        Ok(Box::new(BooleanQuery::new(subqueries)))
+    }
 
-            // 1. 原始字段查询（精确匹配整个查询字符串）
-            let prefixed_value = format!("{}{}{}", path, self.layer.config.path_separator, value);
-            let raw_term = Term::from_field_text(self.layer.text_raw_field, &prefixed_value);
+    /// N-gram 部分匹配查询
+    pub fn ngram_query_with_path(
+        &self,
+        path: &str,
+        value: &str,
+    ) -> tantivy::Result<Box<dyn Query>> {
+        use tantivy::query::{BooleanQuery, EmptyQuery, Occur, Query, TermQuery};
+        use tantivy::tokenizer::Tokenizer;
+
+        // 必须使用与索引时相同的 n-gram 配置来切分查询词
+        let mut tokenizer = NgramTokenizer::new(2, 3, false)?;
+        let mut token_stream = tokenizer.token_stream(value);
+        let path_prefix = format!("{}{}", path, self.layer.config.path_separator);
+
+        let mut subqueries = Vec::new();
+        while token_stream.advance() {
+            let ngram_text = &token_stream.token().text;
+            let term_text = format!("{}{}", path_prefix, ngram_text);
+            let term = Term::from_field_text(self.layer.text_ngram_field, &term_text);
             subqueries.push((
-                Occur::Should,
-                Box::new(TermQuery::new(raw_term, IndexRecordOption::Basic)),
+                Occur::Must,
+                Box::new(TermQuery::new(term, IndexRecordOption::Basic)) as Box<dyn Query>,
             ));
-
-            // 2. 分词字段查询 (AND查询，要求所有词元都存在)
-            let mut tokenizer = self.layer.path_tokenizer.clone();
-            let tokens = tokenizer.tokenize_to_strings(&prefixed_value);
-
-            // 只有当分词结果多于一个，或者单个分词与原始值不同时，才进行分词查询
-            if tokens.len() > 1 || (tokens.len() == 1 && tokens[0] != prefixed_value) {
-                let mut token_queries = Vec::new();
-                for token_str in tokens {
-                    let term = Term::from_field_text(self.layer.text_analyzed_field, &token_str);
-                    token_queries.push((
-                        Occur::Must,
-                        Box::new(TermQuery::new(term, IndexRecordOption::Basic)) as Box<dyn Query>,
-                    ));
-                }
-                if !token_queries.is_empty() {
-                    subqueries.push((Occur::Should, Box::new(BooleanQuery::new(token_queries))));
-                }
-            }
-
-            Ok(Box::new(BooleanQuery::new(subqueries)))
         }
 
-        /// 精确匹配查询 (只查raw字段)
-        pub fn exact_query(
-            &self,
-            path: &str,
-            value: &str,
-        ) -> tantivy::Result<Box<dyn tantivy::query::Query>> {
-            let prefixed_value = format!("{}{}{}", path, self.layer.config.path_separator, value);
-            let term = Term::from_field_text(self.layer.text_raw_field, &prefixed_value);
-            Ok(Box::new(TermQuery::new(
-                term,
-                IndexRecordOption::Basic,
-            )))
+        if subqueries.is_empty() {
+            return Ok(Box::new(EmptyQuery {}));
         }
 
-        /// 带路径的数值范围查询
-        pub fn number_range_query_with_path(
-            &self,
-            path: &str,
-            min: f64,
-            max: f64,
-        ) -> tantivy::Result<Box<dyn tantivy::query::Query>> {
-            use std::ops::Bound;
-            use tantivy::query::RangeQuery;
-
-            let path_prefix = format!("{}{}", path, self.layer.config.path_separator);
-
-            let min_str = format!("{}{}", path_prefix, value_coder::encode_f64(min));
-            let max_str = format!("{}{}", path_prefix, value_coder::encode_f64(max));
-
-            let min_term = Term::from_field_text(self.layer.number_field, &min_str);
-            let max_term = Term::from_field_text(self.layer.number_field, &max_str);
-
-            let range_query =
-                RangeQuery::new(Bound::Included(min_term), Bound::Included(max_term));
-
-            Ok(Box::new(range_query))
-        }
-
-        /// 带路径的日期范围查询
-        pub fn date_range_query_with_path(
-            &self,
-            path: &str,
-            start_date: &str,
-            end_date: &str,
-        ) -> tantivy::Result<Box<dyn tantivy::query::Query>> {
-            use std::ops::Bound;
-            use tantivy::query::RangeQuery;
-
-            let start_dt = self.layer.parse_date_formats(start_date).ok_or_else(|| {
-                tantivy::TantivyError::InvalidArgument(format!(
-                    "Cannot parse start date: {}",
-                    start_date
-                ))
-            })?;
-            let end_dt = self.layer.parse_date_formats(end_date).ok_or_else(|| {
-                tantivy::TantivyError::InvalidArgument(format!("Cannot parse end date: {}", end_date))
-            })?;
-
-            let path_prefix = format!("{}{}", path, self.layer.config.path_separator);
-
-            let start_str = format!("{}{}", path_prefix, value_coder::encode_date(start_dt));
-            let end_str = format!("{}{}", path_prefix, value_coder::encode_date(end_dt));
-
-            let start_term = Term::from_field_text(self.layer.date_field, &start_str);
-            let end_term = Term::from_field_text(self.layer.date_field, &end_str);
-
-            let range_query =
-                RangeQuery::new(Bound::Included(start_term), Bound::Included(end_term));
-
-            Ok(Box::new(range_query))
-        }
+        Ok(Box::new(BooleanQuery::new(subqueries)))
     }
+
+    /// 精确匹配查询 (只查raw字段)
+    pub fn exact_query(
+        &self,
+        path: &str,
+        value: &str,
+    ) -> tantivy::Result<Box<dyn tantivy::query::Query>> {
+        let prefixed_value = format!("{}{}{}", path, self.layer.config.path_separator, value);
+        let term = Term::from_field_text(self.layer.text_raw_field, &prefixed_value);
+        Ok(Box::new(TermQuery::new(
+            term,
+            IndexRecordOption::Basic,
+        )))
+    }
+
+    /// 带路径的数值范围查询
+    pub fn number_range_query_with_path(
+        &self,
+        path: &str,
+        min: f64,
+        max: f64,
+    ) -> tantivy::Result<Box<dyn tantivy::query::Query>> {
+        use std::ops::Bound;
+        use tantivy::query::RangeQuery;
+
+        let path_prefix = format!("{}{}", path, self.layer.config.path_separator);
+
+        let min_str = format!("{}{}", path_prefix, value_coder::encode_f64(min));
+        let max_str = format!("{}{}", path_prefix, value_coder::encode_f64(max));
+
+        let min_term = Term::from_field_bytes(self.layer.number_field, min_str.as_bytes());
+        let max_term = Term::from_field_bytes(self.layer.number_field, max_str.as_bytes());
+
+        let range_query =
+            RangeQuery::new(Bound::Included(min_term), Bound::Included(max_term));
+
+        Ok(Box::new(range_query))
+    }
+
+    /// 带路径的日期范围查询
+    pub fn date_range_query_with_path(
+        &self,
+        path: &str,
+        start_date: &str,
+        end_date: &str,
+    ) -> tantivy::Result<Box<dyn tantivy::query::Query>> {
+        use std::ops::Bound;
+        use tantivy::query::RangeQuery;
+
+        let start_dt = self.layer.parse_date_formats(start_date).ok_or_else(|| {
+            tantivy::TantivyError::InvalidArgument(format!(
+                "Cannot parse start date: {}",
+                start_date
+            ))
+        })?;
+        let end_dt = self.layer.parse_date_formats(end_date).ok_or_else(|| {
+            tantivy::TantivyError::InvalidArgument(format!("Cannot parse end date: {}", end_date))
+        })?;
+
+        let path_prefix = format!("{}{}", path, self.layer.config.path_separator);
+
+        let start_str = format!("{}{}", path_prefix, value_coder::encode_date(start_dt));
+        let end_str = format!("{}{}", path_prefix, value_coder::encode_date(end_dt));
+
+        let start_term = Term::from_field_bytes(self.layer.date_field, start_str.as_bytes());
+        let end_term = Term::from_field_bytes(self.layer.date_field, end_str.as_bytes());
+
+        let range_query =
+            RangeQuery::new(Bound::Included(start_term), Bound::Included(end_term));
+
+        Ok(Box::new(range_query))
+    }
+}
 }
 
 fn main() -> tantivy::Result<()> {
@@ -683,11 +829,15 @@ fn main() -> tantivy::Result<()> {
             println!("✅ Document {} indexed.", i + 1);
         }
     }
-
+    print!("here 0");
     index_writer.commit()?;
+    print!("here 1");
     let reader = index.reader()?;
+    print!("here 2");
     let searcher = reader.searcher();
+    print!("here 3");
     let query_builder = SmartJsonQueryBuilder::new(layer.clone());
+    print!("here 4");
 
     // 2. 运行核心查询测试
     println!("\n🔍 Running Core Query Tests...");
@@ -737,6 +887,14 @@ fn main() -> tantivy::Result<()> {
         &searcher,
         query,
         "Date range for establishment in year 2020",
+    )?;
+
+    // f. N-gram 部分词查询
+    let query = query_builder.ngram_query_with_path("product_description", "librar")?;
+    run_query_and_print_results(
+        &searcher,
+        query,
+        "N-gram search for partial word 'librar' in 'product_description'",
     )?;
 
     println!("\n---\n💡 Index Location: '{}'", index_path);
