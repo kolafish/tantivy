@@ -227,56 +227,27 @@ impl TokenStream for PathPrefixNgramTokenStream {
     }
 }
 
-/// 值编码模块 - 用于将数值/日期等类型编码为可按字典序排序的字符串
-///
-/// ## 设计动机
-///
-/// 在 `tantivy` 中，专用的数值字段（如 `f64`, `date`）通过 `Term` 内部的 `set_fast_value`
-/// 逻辑，将数值转换为保留其大小顺序的大端字节序（`&[u8]`）进行存储和范围查询。
-/// 这种二进制表示是最高效的，但不一定是合法的 UTF-8 字符串。
-///
-/// 在本实现中，为了在一个字段内同时实现 “路径过滤” 和 “范围查询”，我们将数值/日期字段
-/// 定义为了 `text` 类型，并使用 `raw` 分词器。这意味着我们必须将 `路径` 和 `值`
-/// 拼接成一个**单一的、合法的字符串**来作为 `Term`。
-///
-/// ## 实现策略
-///
-/// `value_coder` 的作用就是解决这个问题：
-/// 1. **借鉴核心思想**: 采用与 `tantivy` 内部相同的位操作逻辑，将 `f64`/`i64` (来自`DateTime`)
-///    转换为一个保留原始大小顺序的 `u64`。
-/// 2. **适配为字符串**: 将这个 `u64` 值编码为一个定长的**十六进制字符串**。十六进制表示法
-///    既能完整地代表底层的二进制数据，其字典序也等同于原始数值的顺序，同时它本身是
-///    合法的 UTF-8 字符。
-///
-/// 最终，我们可以安全地构建如 `product_price__800533325996fbe5` 这样的字符串，
-/// 它可以在一个 `text` 字段上通过 `RangeQuery` 进行高效的、带路径的范围查找。
 mod value_coder {
     use tantivy::DateTime;
 
-    /// 将 i64 编码为保持排序性的 u64 (Sign-flipping)
-    fn i64_to_sortable_u64(val: i64) -> u64 {
-        (val as u64) ^ (1u64 << 63)
-    }
-
-    /// 将 f64 编码为保持排序性的 u64
-    /// 正数: sign bit 设为 1
-    /// 负数: 所有 bit 位取反
-    fn f64_to_sortable_u64(val: f64) -> u64 {
+    pub fn encode_f64(val: f64) -> [u8; 8] {
+        // 将 f64 编码为保持排序性的 u64
+        // 正数: sign bit 设为 1
+        // 负数: 所有 bit 位取反
         let u64_val = val.to_bits();
-        if val >= 0.0 {
+        let sortable_u64 = if val >= 0.0 {
             u64_val | (1u64 << 63)
         } else {
             !u64_val
-        }
+        };
+        sortable_u64.to_be_bytes()
     }
 
-    pub fn encode_f64(val: f64) -> String {
-        format!("{:016x}", f64_to_sortable_u64(val))
-    }
-
-    pub fn encode_date(val: DateTime) -> String {
+    pub fn encode_date(val: DateTime) -> [u8; 8] {
+        // 将 i64 编码为保持排序性的 u64 (Sign-flipping)
         let i64_val = val.into_timestamp_micros();
-        format!("{:016x}", i64_to_sortable_u64(i64_val))
+        let sortable_u64 = (i64_val as u64) ^ (1u64 << 63);
+        sortable_u64.to_be_bytes()
     }
 }
 
@@ -527,9 +498,10 @@ impl FixedJsonLayer {
     /// 添加日期值
     fn add_date_value(&self, doc: &mut TantivyDocument, field_name: &str, date_time: DateTime) {
         let encoded_date = value_coder::encode_date(date_time);
-        let path_value =
-            format!("{}{}{}", field_name, self.config.path_separator, encoded_date);
-        doc.add_bytes(self.date_field, path_value.as_bytes());
+        let mut path_value =
+            format!("{}{}", field_name, self.config.path_separator).into_bytes();
+        path_value.extend_from_slice(&encoded_date);
+        doc.add_bytes(self.date_field, &path_value);
     }
 
     /// 简化的文本分类
@@ -584,8 +556,9 @@ impl FixedJsonLayer {
     /// 添加数值
     fn add_number_value(&self, doc: &mut TantivyDocument, path: &str, value: f64) {
         let encoded_num = value_coder::encode_f64(value);
-        let path_value = format!("{}{}{}", path, self.config.path_separator, encoded_num);
-        doc.add_bytes(self.number_field, path_value.as_bytes());
+        let mut path_value = format!("{}{}", path, self.config.path_separator).into_bytes();
+        path_value.extend_from_slice(&encoded_num);
+        doc.add_bytes(self.number_field, &path_value);
     }
 
     /// 添加布尔值
@@ -699,13 +672,16 @@ impl SmartJsonQueryBuilder {
         use std::ops::Bound;
         use tantivy::query::RangeQuery;
 
-        let path_prefix = format!("{}{}", path, self.layer.config.path_separator);
+        let path_prefix_bytes = format!("{}{}", path, self.layer.config.path_separator).into_bytes();
 
-        let min_str = format!("{}{}", path_prefix, value_coder::encode_f64(min));
-        let max_str = format!("{}{}", path_prefix, value_coder::encode_f64(max));
+        let mut min_bytes = path_prefix_bytes.clone();
+        min_bytes.extend_from_slice(&value_coder::encode_f64(min));
 
-        let min_term = Term::from_field_bytes(self.layer.number_field, min_str.as_bytes());
-        let max_term = Term::from_field_bytes(self.layer.number_field, max_str.as_bytes());
+        let mut max_bytes = path_prefix_bytes;
+        max_bytes.extend_from_slice(&value_coder::encode_f64(max));
+
+        let min_term = Term::from_field_bytes(self.layer.number_field, &min_bytes);
+        let max_term = Term::from_field_bytes(self.layer.number_field, &max_bytes);
 
         let range_query =
             RangeQuery::new(Bound::Included(min_term), Bound::Included(max_term));
@@ -733,13 +709,18 @@ impl SmartJsonQueryBuilder {
             tantivy::TantivyError::InvalidArgument(format!("Cannot parse end date: {}", end_date))
         })?;
 
-        let path_prefix = format!("{}{}", path, self.layer.config.path_separator);
+        let path_prefix_bytes = format!("{}{}", path, self.layer.config.path_separator).into_bytes();
 
-        let start_str = format!("{}{}", path_prefix, value_coder::encode_date(start_dt));
-        let end_str = format!("{}{}", path_prefix, value_coder::encode_date(end_dt));
+        let start_dt_bytes = value_coder::encode_date(start_dt);
+        let mut min_bytes = path_prefix_bytes.clone();
+        min_bytes.extend_from_slice(&start_dt_bytes);
 
-        let start_term = Term::from_field_bytes(self.layer.date_field, start_str.as_bytes());
-        let end_term = Term::from_field_bytes(self.layer.date_field, end_str.as_bytes());
+        let end_dt_bytes = value_coder::encode_date(end_dt);
+        let mut max_bytes = path_prefix_bytes;
+        max_bytes.extend_from_slice(&end_dt_bytes);
+
+        let start_term = Term::from_field_bytes(self.layer.date_field, &min_bytes);
+        let end_term = Term::from_field_bytes(self.layer.date_field, &max_bytes);
 
         let range_query =
             RangeQuery::new(Bound::Included(start_term), Bound::Included(end_term));
@@ -798,6 +779,7 @@ fn main() -> tantivy::Result<()> {
             "review_verified": [true, true, false, true, true],
             "inventory_stock": 50,
             "inventory_colors": ["black", "white", "blue"],
+            "company_established_date": "2020-11-15T09:00:00Z",
             "inventory_availability": true,
             "product_launch_date": "2024-02-14",
             "test_wrong":25,
@@ -817,6 +799,7 @@ fn main() -> tantivy::Result<()> {
             "metrics_impact_factor": 2.8,
             "research_keywords": ["information retrieval", "search engines", "natural language processing"],
             "paper_published_date": "2023-05-20T12:00:00Z",
+            "company_established_date": "2020-08-15",
             "paper_submitted_date": "2023-02-28",
             "metrics_last_calculated": "2024-07-15T10:00:00Z"
         })
@@ -829,15 +812,10 @@ fn main() -> tantivy::Result<()> {
             println!("✅ Document {} indexed.", i + 1);
         }
     }
-    print!("here 0");
     index_writer.commit()?;
-    print!("here 1");
     let reader = index.reader()?;
-    print!("here 2");
     let searcher = reader.searcher();
-    print!("here 3");
     let query_builder = SmartJsonQueryBuilder::new(layer.clone());
-    print!("here 4");
 
     // 2. 运行核心查询测试
     println!("\n🔍 Running Core Query Tests...");
@@ -896,6 +874,10 @@ fn main() -> tantivy::Result<()> {
         query,
         "N-gram search for partial word 'librar' in 'product_description'",
     )?;
+
+    // g. 数组数值范围查询
+    let query = query_builder.number_range_query_with_path("metrics_downloads", 80.0, 90.0)?;
+    run_query_and_print_results(&searcher, query, "Number range for metrics_downloads between 80 and 90")?;
 
     println!("\n---\n💡 Index Location: '{}'", index_path);
 
