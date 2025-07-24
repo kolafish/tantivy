@@ -107,14 +107,44 @@ impl TokenStream for PathPrefixTokenStream {
     }
 }
 
-/// 优化版 JSON 处理层 - 扁平结构 + 自定义分词器 + 磁盘持久化 + 专用路径字段
+/// 值编码模块 - 用于将数值/日期等类型编码为可按字典序排序的字符串
+mod value_coder {
+    use tantivy::DateTime;
+
+    /// 将 i64 编码为保持排序性的 u64 (Sign-flipping)
+    fn i64_to_sortable_u64(val: i64) -> u64 {
+        (val as u64) ^ (1u64 << 63)
+    }
+
+    /// 将 f64 编码为保持排序性的 u64
+    /// 正数: sign bit 设为 1
+    /// 负数: 所有 bit 位取反
+    fn f64_to_sortable_u64(val: f64) -> u64 {
+        let u64_val = val.to_bits();
+        if val >= 0.0 {
+            u64_val | (1u64 << 63)
+        } else {
+            !u64_val
+        }
+    }
+
+    pub fn encode_f64(val: f64) -> String {
+        format!("{:016x}", f64_to_sortable_u64(val))
+    }
+
+    pub fn encode_date(val: DateTime) -> String {
+        let i64_val = val.into_timestamp_micros();
+        format!("{:016x}", i64_to_sortable_u64(i64_val))
+    }
+}
+
+/// 优化版 JSON 处理层 - 扁平结构 + 自定义分词器 + 磁盘持久化
 pub struct FixedJsonLayer {
     text_analyzed_field: Field,      // 分词文本字段（使用自定义分词器）
     text_raw_field: Field,           // 原始文本字段（raw分词器）
     number_field: Field,             // 数值字段
     bool_field: Field,               // 布尔字段
-    date_field: Field,               // 日期字段
-    path_field: Field,               // 🆕 专用路径字段（用于精确路径匹配）
+    date_field: Field,               // 日期字段（重要！）
     
     schema: Schema,
     config: JsonLayerConfig,
@@ -195,9 +225,16 @@ impl FixedJsonLayer {
                 .set_stored()
         );
         
-        let number_field = schema_builder.add_f64_field(
+        // 将 number_field 和 date_field 定义为 text 字段，使用 raw 分词器
+        // 以便存储 `path + encoded_value` 并支持范围查询
+        let number_field = schema_builder.add_text_field(
             "json_number",
-            NumericOptions::default().set_indexed().set_stored().set_fast()
+            TextOptions::default()
+                .set_indexing_options(
+                    TextFieldIndexing::default()
+                        .set_tokenizer("raw")
+                        .set_index_option(IndexRecordOption::Basic)
+                )
         );
         
         let bool_field = schema_builder.add_bool_field(
@@ -205,21 +242,14 @@ impl FixedJsonLayer {
             NumericOptions::default().set_indexed().set_stored().set_fast()
         );
         
-        let date_field = schema_builder.add_date_field(
+        let date_field = schema_builder.add_text_field(
             "json_date",
-            tantivy::schema::DateOptions::default().set_indexed().set_stored().set_fast()
-        );
-        
-        // 🆕 专用路径字段：用于存储字段路径，支持精确匹配
-        let path_field = schema_builder.add_text_field(
-            "json_path",
             TextOptions::default()
                 .set_indexing_options(
                     TextFieldIndexing::default()
-                        .set_tokenizer("raw") // 使用raw分词器，因为路径是精确的
+                        .set_tokenizer("raw")
                         .set_index_option(IndexRecordOption::Basic)
                 )
-                .set_stored()
         );
         
         let schema = schema_builder.build();
@@ -232,7 +262,6 @@ impl FixedJsonLayer {
             number_field,
             bool_field,
             date_field,
-            path_field,
             schema,
             config,
             path_tokenizer,
@@ -351,19 +380,11 @@ impl FixedJsonLayer {
         None
     }
     
-    /// 添加日期值 - 改进版：使用专用路径字段
+    /// 添加日期值
     fn add_date_value(&self, doc: &mut TantivyDocument, field_name: &str, date_time: DateTime) {
-        // 1. 存储到专用日期字段（用于高效范围查询）
-        doc.add_date(self.date_field, date_time);
-        
-        // 2. 存储路径到专用路径字段（用于精确路径匹配）
-        doc.add_text(self.path_field, field_name);
-        
-        // // 3. 保留原有的文本字段存储（用于向后兼容和调试）
-        // let date_string = format!("{}{}{}", field_name, self.config.path_separator, 
-        //     date_time.into_utc().format(&time::format_description::well_known::Iso8601::DEFAULT)
-        //         .unwrap_or_else(|_| "invalid_date".to_string()));
-        // doc.add_text(self.text_raw_field, &date_string);
+        let encoded_date = value_coder::encode_date(date_time);
+        let path_value = format!("{}{}{}", field_name, self.config.path_separator, encoded_date);
+        doc.add_text(self.date_field, &path_value);
     }
     
     /// 简化的文本分类
@@ -414,26 +435,19 @@ impl FixedJsonLayer {
         }
     }
     
-    /// 添加数值 - 改进版：使用专用路径字段
+    /// 添加数值
     fn add_number_value(&self, doc: &mut TantivyDocument, path: &str, value: f64) {
-        // 1. 存储到专用数值字段（用于高效范围查询）
-        doc.add_f64(self.number_field, value);
-        
-        // 2. 存储路径到专用路径字段（用于精确路径匹配）
-        doc.add_text(self.path_field, path);       
+        let encoded_num = value_coder::encode_f64(value);
+        let path_value = format!("{}{}{}", path, self.config.path_separator, encoded_num);
+        doc.add_text(self.number_field, &path_value);
     }
     
-    /// 添加布尔值 - 改进版：使用专用路径字段
+    /// 添加布尔值
     fn add_bool_value(&self, doc: &mut TantivyDocument, path: &str, value: bool) {
-        // 1. 存储到专用布尔字段（用于高效查询）
         doc.add_bool(self.bool_field, value);
         
-        // 2. 存储路径到专用路径字段（用于精确路径匹配）
-        doc.add_text(self.path_field, path);
-        
-        // // 3. 保留原有的文本字段存储（用于向后兼容和调试）
-        // let path_value = format!("{}{}{}_{}", path, self.config.path_separator, "bool", value);
-        // doc.add_text(self.text_raw_field, &path_value);
+        let path_value = format!("{}{}{}_{}", path, self.config.path_separator, "bool", value);
+        doc.add_text(self.text_raw_field, &path_value);
     }
 }
 
@@ -488,95 +502,100 @@ impl SmartJsonQueryBuilder {
         let prefixed_value = format!("{}{}{}", path, self.layer.config.path_separator, value);
         let term = Term::from_field_text(self.layer.text_raw_field, &prefixed_value);
         Ok(Box::new(TermQuery::new(term, IndexRecordOption::Basic)))
-    }   
+    }
     
-    /// 带路径的数值范围查询 - 改进版：使用专用路径字段
+    // /// 数值范围查询（全局）
+    // pub fn number_range_query(&self, min: f64, max: f64) -> tantivy::Result<Box<dyn tantivy::query::Query>> {
+    //     use tantivy::query::RangeQuery;
+    //     use std::ops::Bound;
+        
+    //     let min_term = Term::from_field_f64(self.layer.number_field, min);
+    //     let max_term = Term::from_field_f64(self.layer.number_field, max);
+        
+    //     Ok(Box::new(RangeQuery::new(
+    //         Bound::Included(min_term),
+    //         Bound::Included(max_term)
+    //     )))
+    // }
+    
+    /// 带路径的数值范围查询 - 两阶段策略
     pub fn number_range_query_with_path(&self, path: &str, min: f64, max: f64) -> tantivy::Result<Box<dyn tantivy::query::Query>> {
-        use tantivy::query::{RangeQuery, BooleanQuery, Occur, TermQuery};
+        use tantivy::query::RangeQuery;
         use std::ops::Bound;
         
-        // 第一阶段：使用数值字段进行高效范围查询
-        let min_term = Term::from_field_f64(self.layer.number_field, min);
-        let max_term = Term::from_field_f64(self.layer.number_field, max);
+        let path_prefix = format!("{}{}", path, self.layer.config.path_separator);
+
+        let min_str = format!("{}{}", path_prefix, value_coder::encode_f64(min));
+        let max_str = format!("{}{}", path_prefix, value_coder::encode_f64(max));
+
+        let min_term = Term::from_field_text(self.layer.number_field, &min_str);
+        let max_term = Term::from_field_text(self.layer.number_field, &max_str);
+
         let range_query = RangeQuery::new(
             Bound::Included(min_term),
             Bound::Included(max_term)
         );
         
-        // 🆕 第二阶段：使用专用路径字段进行精确路径匹配（替代正则表达式）
-        let path_term = Term::from_field_text(self.layer.path_field, path);
-        let path_query = TermQuery::new(path_term, IndexRecordOption::Basic);
-        
-        // 组合查询：必须同时满足数值范围和精确路径匹配
-        let combined_query = BooleanQuery::new(vec![
-            (Occur::Must, Box::new(range_query) as Box<dyn tantivy::query::Query>),
-            (Occur::Must, Box::new(path_query) as Box<dyn tantivy::query::Query>),
-        ]);
-        
-        Ok(Box::new(combined_query))
+        Ok(Box::new(range_query))
     }
     
-    /// 带路径的日期范围查询 - 改进版：使用专用路径字段
+    // /// 日期范围查询（全局）
+    // pub fn date_range_query(&self, start_date: &str, end_date: &str) -> tantivy::Result<Box<dyn tantivy::query::Query>> {
+    //     use tantivy::query::RangeQuery;
+    //     use std::ops::Bound;
+        
+    //     let start_dt = self.layer.parse_date_formats(start_date)
+    //         .ok_or_else(|| tantivy::TantivyError::InvalidArgument(format!("Cannot parse start date: {}", start_date)))?;
+    //     let end_dt = self.layer.parse_date_formats(end_date)
+    //         .ok_or_else(|| tantivy::TantivyError::InvalidArgument(format!("Cannot parse end date: {}", end_date)))?;
+            
+    //     let start_term = Term::from_field_date(self.layer.date_field, start_dt);
+    //     let end_term = Term::from_field_date(self.layer.date_field, end_dt);
+        
+    //     Ok(Box::new(RangeQuery::new(
+    //         Bound::Included(start_term),
+    //         Bound::Included(end_term)
+    //     )))
+    // }
+    
+    /// 带路径的日期范围查询 - 两阶段策略
     pub fn date_range_query_with_path(&self, path: &str, start_date: &str, end_date: &str) -> tantivy::Result<Box<dyn tantivy::query::Query>> {
-        use tantivy::query::{RangeQuery, BooleanQuery, Occur, TermQuery};
+        use tantivy::query::RangeQuery;
         use std::ops::Bound;
         
-        // 第一阶段：使用日期字段进行高效范围查询
         let start_dt = self.layer.parse_date_formats(start_date)
             .ok_or_else(|| tantivy::TantivyError::InvalidArgument(format!("Cannot parse start date: {}", start_date)))?;
         let end_dt = self.layer.parse_date_formats(end_date)
             .ok_or_else(|| tantivy::TantivyError::InvalidArgument(format!("Cannot parse end date: {}", end_date)))?;
             
-        let start_term = Term::from_field_date(self.layer.date_field, start_dt);
-        let end_term = Term::from_field_date(self.layer.date_field, end_dt);
+        let path_prefix = format!("{}{}", path, self.layer.config.path_separator);
+
+        let start_str = format!("{}{}", path_prefix, value_coder::encode_date(start_dt));
+        let end_str = format!("{}{}", path_prefix, value_coder::encode_date(end_dt));
+
+        let start_term = Term::from_field_text(self.layer.date_field, &start_str);
+        let end_term = Term::from_field_text(self.layer.date_field, &end_str);
+        
         let range_query = RangeQuery::new(
             Bound::Included(start_term),
             Bound::Included(end_term)
         );
         
-        // 🆕 第二阶段：使用专用路径字段进行精确路径匹配（替代正则表达式）
-        let path_term = Term::from_field_text(self.layer.path_field, path);
-        let path_query = TermQuery::new(path_term, IndexRecordOption::Basic);
-        
-        // 组合查询：必须同时满足日期范围和精确路径匹配
-        let combined_query = BooleanQuery::new(vec![
-            (Occur::Must, Box::new(range_query) as Box<dyn tantivy::query::Query>),
-            (Occur::Must, Box::new(path_query) as Box<dyn tantivy::query::Query>),
-        ]);
-        
-        Ok(Box::new(combined_query))
+        Ok(Box::new(range_query))
     }
     
     /// 日期精确查询
-    pub fn date_exact_query(&self, date_str: &str) -> tantivy::Result<Box<dyn tantivy::query::Query>> {
+    pub fn date_exact_query(&self, path: &str, date_str: &str) -> tantivy::Result<Box<dyn tantivy::query::Query>> {
         use tantivy::query::TermQuery;
         
         let date_time = self.layer.parse_date_formats(date_str)
             .ok_or_else(|| tantivy::TantivyError::InvalidArgument(format!("Cannot parse date: {}", date_str)))?;
             
-        let term = Term::from_field_date(self.layer.date_field, date_time);
+        let encoded_date = value_coder::encode_date(date_time);
+        let path_value = format!("{}{}{}", path, self.layer.config.path_separator, encoded_date);
+        
+        let term = Term::from_field_text(self.layer.date_field, &path_value);
         Ok(Box::new(TermQuery::new(term, IndexRecordOption::Basic)))
-    }
-    
-    /// 🆕 带路径的布尔值查询 - 使用专用路径字段
-    pub fn bool_query_with_path(&self, path: &str, value: bool) -> tantivy::Result<Box<dyn tantivy::query::Query>> {
-        use tantivy::query::{BooleanQuery, Occur, TermQuery};
-        
-        // 第一阶段：使用布尔字段进行高效查询
-        let bool_term = Term::from_field_bool(self.layer.bool_field, value);
-        let bool_query = TermQuery::new(bool_term, IndexRecordOption::Basic);
-        
-        // 第二阶段：使用专用路径字段进行精确路径匹配
-        let path_term = Term::from_field_text(self.layer.path_field, path);
-        let path_query = TermQuery::new(path_term, IndexRecordOption::Basic);
-        
-        // 组合查询：必须同时满足布尔值和精确路径匹配
-        let combined_query = BooleanQuery::new(vec![
-            (Occur::Must, Box::new(bool_query) as Box<dyn tantivy::query::Query>),
-            (Occur::Must, Box::new(path_query) as Box<dyn tantivy::query::Query>),
-        ]);
-        
-        Ok(Box::new(combined_query))
     }
 }
 
@@ -584,8 +603,8 @@ fn main() -> tantivy::Result<()> {
     use serde_json::json;
     use tantivy::collector::TopDocs;
     
-    println!("🚀 Optimized JSON Processing Layer - Enhanced with Dedicated Path Field");
-    println!("📋 Features: Flat JSON, custom tokenizer, dedicated path field, efficient range queries");
+    println!("🚀 Optimized JSON Processing Layer - Flat Structure + Disk Persistence");
+    println!("📋 Features: Flat JSON, custom tokenizer, disk persistence, array support");
     
     // 创建修复版 JSON 处理层
     let layer = FixedJsonLayer::new()?;
@@ -676,6 +695,7 @@ fn main() -> tantivy::Result<()> {
             "inventory_availability": true,
             "product_launch_date": "2024-02-14",
             "test_wrong":25,
+            "user_age": 80,
             "inventory_last_updated": "2024-07-21T08:30:00Z"
         }),
         
@@ -685,6 +705,7 @@ fn main() -> tantivy::Result<()> {
             "paper_authors": ["Dr. John Smith", "Prof. Jane Doe"],
             "paper_year": 2023,
             "test_wrong":149.99,
+            "product_price": 19.99,
             "metrics_citations": 42,
             "metrics_downloads": [120, 95, 87, 76],
             "metrics_impact_factor": 2.8,
@@ -756,8 +777,7 @@ fn main() -> tantivy::Result<()> {
     println!("   Results: {} documents found {}", results.len(), if results.len() > 0 { "✅" } else { "❌" });
     
     // 数值范围查询测试
-    println!("\n🔢 === Number Range Query Tests (Using Dedicated Path Field) ===");
-    println!("   🆕 Improvement: Replaced regex queries with efficient exact path matching!");
+    println!("\n🔢 === Number Range Query Tests ===");
     
     // 7. 带路径的价格范围查询
     println!("\n7. Price range query with path (140-160) for product_price:");
@@ -814,8 +834,7 @@ fn main() -> tantivy::Result<()> {
     println!("   Results: {} documents found {}", results.len(), if results.len() > 0 { "✅" } else { "❌" });
     
     // 日期查询测试
-    println!("\n📅 === Date Query Tests (Using Dedicated Path Field) ===");
-    println!("   🆕 Improvement: Fast range queries + precise path matching, no more regex!");
+    println!("\n📅 === Date Query Tests ===");
     
     // 15. 带路径的用户创建时间范围查询
     println!("\n15. Date range query with path for user_created_at (Jan 2024):");
@@ -825,29 +844,13 @@ fn main() -> tantivy::Result<()> {
     
     // 16. 带路径的产品发布日期精确查询
     println!("\n16. Date exact query with path for product_launch_date:");
-    let query = query_builder.date_exact_query("2024-02-14")?;
+    let query = query_builder.date_exact_query("product_launch_date", "2024-02-14")?;
     let results = searcher.search(&*query, &TopDocs::with_limit(10))?;
     println!("   Results: {} documents found {}", results.len(), if results.len() > 0 { "✅" } else { "❌" });
     
     // 17. 带路径的最近更新查询
     println!("\n17. Recent updates query with path for company_last_updated (July 2024):");
     let query = query_builder.date_range_query_with_path("company_last_updated", "2024-07-01T00:00:00Z", "2024-07-31T23:59:59Z")?;
-    let results = searcher.search(&*query, &TopDocs::with_limit(10))?;
-    println!("   Results: {} documents found {}", results.len(), if results.len() > 0 { "✅" } else { "❌" });
-    
-    // 🆕 布尔值查询测试
-    println!("\n🔘 === Boolean Query Tests (Using Dedicated Path Field) ===");
-    println!("   🆕 New Feature: Efficient boolean queries with path precision!");
-    
-    // 18. 带路径的布尔值查询
-    println!("\n18. Boolean query with path for product_active = true:");
-    let query = query_builder.bool_query_with_path("product_active", true)?;
-    let results = searcher.search(&*query, &TopDocs::with_limit(10))?;
-    println!("   Results: {} documents found {}", results.len(), if results.len() > 0 { "✅" } else { "❌" });
-    
-    // 19. 带路径的布尔值查询 - 库存可用性
-    println!("\n19. Boolean query with path for inventory_availability = true:");
-    let query = query_builder.bool_query_with_path("inventory_availability", true)?;
     let results = searcher.search(&*query, &TopDocs::with_limit(10))?;
     println!("   Results: {} documents found {}", results.len(), if results.len() > 0 { "✅" } else { "❌" });
     
