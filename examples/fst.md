@@ -144,57 +144,6 @@ if node.is_final() {
 
 希望这份解读能帮助您理解 `Fst` 的工作原理。总而言之，它是一个通过共享前后缀将大量有序键值对压缩成一个有向无环图，并能在此图上进行极快查询的强大数据结构。
 
-```rust
-pub struct Fst<Data = Vec<u8>> {
-    meta: FstMeta,
-    data: Data,
-}
-
-struct FstMeta {
-    version: u64,
-    root_addr: CompiledAddr, // usize, 根节点的地址
-    ty: FstType,           // u64, FST 的类型
-    len: usize,              // FST 中键的数量
-}
-```
-
-```rust
-        pub struct Transition {
-            pub inp: u8,            // 输入字节
-            pub out: Output,        // 输出值
-            pub addr: CompiledAddr, // 目标节点的地址
-        }
-```
-
-```rust
-// 伪代码展示 get("feb") 的流程
-let mut node = fst.root(); // 从根节点开始
-let mut output = 0;
-
-// 1. 跟随 'f'
-let transition_f = node.find_transition('f');
-output += transition_f.output; // 累加输出值
-node = fst.node(transition_f.addr); // 跳转到下一个节点
-
-// 2. 跟随 'e'
-let transition_e = node.find_transition('e');
-output += transition_e.output;
-node = fst.node(transition_e.addr);
-
-// 3. 跟随 'b'
-let transition_b = node.find_transition('b');
-output += transition_b.output;
-node = fst.node(transition_b.addr);
-
-// 4. 检查是否是最终节点
-if node.is_final() {
-    output += node.final_output(); // 加上最终节点的输出值
-    return Some(output);
-} else {
-    return None;
-}
-```
-
 ---
 
 **User**
@@ -313,39 +262,3 @@ pub trait TermStreamer: Sized {
 *   `sstable_termdict` 可能作为一种备选方案或在某些特定场景下使用。
 
 两者共同服务于 `tantivy` 的核心目标：提供一个高性能、高效率的全文搜索引擎。
-
-```rust
-// src/termdict/mod.rs
-
-// ...
-/// The term dictionary is the structure that maps `Term`s to their `TermInfo`.
-pub trait TermDictionary: Send + Sync {
-    /// A cursor over the entries of the dictionary.
-    type Streamer: TermStreamer + Send;
-
-    /// Returns a cursor over the all of the terms of the dictionary.
-    fn stream(&self) -> Self::Streamer;
-
-    // ... methods for range queries, automaton searches ...
-
-    /// Returns the number of terms in the dictionary.
-    fn num_terms(&self) -> usize;
-
-    /// Returns the term associated with a given term ordinal.
-    fn term_ord(&self, term_ord: Term) -> Option<Term>;
-
-    /// Returns the term ordinal associated with a given term.
-    fn term_info(&self, term: &Term) -> Option<TermInfo>;
-
-    // ...
-}
-
-/// `TermStreamer` is an iterator over a range of terms in a `TermDictionary`.
-pub trait TermStreamer: Sized {
-    /// Advance the cursor to the next term.
-    fn advance(&mut self) -> bool;
-    // ...
-}
-// ...
-```
-
