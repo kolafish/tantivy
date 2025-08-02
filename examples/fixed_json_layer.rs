@@ -1,5 +1,5 @@
 use tantivy::schema::{
-    self, Field, IndexRecordOption, Schema, SchemaBuilder, TextFieldIndexing, TextOptions,
+    self, Document, Field, IndexRecordOption, Schema, SchemaBuilder, TextFieldIndexing, TextOptions,
 };
 use tantivy::tokenizer::{Token, Tokenizer, TokenStream};
 use tantivy::{
@@ -823,46 +823,90 @@ fn main() -> tantivy::Result<()> {
     // 辅助函数，用于执行查询并打印结果
     fn run_query_and_print_results(
         searcher: &Searcher,
+        schema: &Schema, // 传入 schema 用于打印
         query: Box<dyn Query>,
         description: &str,
     ) -> tantivy::Result<()> {
-        let top_docs = searcher.search(&*query, &TopDocs::with_limit(5))?;
         println!("\n---");
         println!("💬 Query: {}", description);
-        println!("🎯 Found {} documents.", top_docs.len());
-        for (_score, doc_address) in top_docs {
-            println!("   - Doc Address: {:?}", doc_address);
+
+        // =========================================================================
+        // 阶段 1: 搜索与收集
+        // - 调用 searcher.search()
+        // - Tantivy 在此步骤中仅使用倒排索引和快速字段来查找匹配的文档ID。
+        // - TopDocs collector 会收集评分最高的文档的地址 (DocAddress)。
+        // - 此时，原始的、行存储的文档内容完全没有被读取。
+        // =========================================================================
+        println!("  -> [阶段 1] 开始搜索和收集... (仅使用索引)");
+        let top_docs = searcher.search(&*query, &TopDocs::with_limit(5))?;
+        println!("  -> [阶段 1] 完成. 找到 {} 个匹配文档的引用.", top_docs.len());
+
+        if top_docs.is_empty() {
+            return Ok(());
         }
+
+        // =========================================================================
+        // 阶段 2: 文档提取
+        // - 迭代 `top_docs` 返回的结果 (一个包含 DocAddress 的Vec)。
+        // - 对于每一个 DocAddress，调用 searcher.doc()。
+        // - **就在 `searcher.doc()` 调用内部，Tantivy 才会访问行存 (Store)，
+        //   解压并重建原始的 TantivyDocument。**
+        // =========================================================================
+        println!("  -> [阶段 2] 开始从行存(Store)中提取具体文档内容...");
+        for (score, doc_address) in top_docs {
+            // *** 读取行存数据的关键点就在下面这行代码 ***
+            let doc: TantivyDocument = searcher.doc(doc_address)?;
+            println!(
+                "    - Doc Address: {:?}, Score: {:.4}, 内容: {}",
+                doc_address,
+                score,
+                doc.to_json(schema) // 将文档转为JSON以便查看
+            );
+        }
+        println!("  -> [阶段 2] 完成.");
         Ok(())
     }
 
     // --- 测试用例 ---
+    let schema = layer.schema().clone();
 
     // a. 关键词查询 (精确匹配)
     let query = query_builder.smart_query("company_country", "USA")?;
-    run_query_and_print_results(&searcher, query, "Keyword search for country 'USA'")?;
+    run_query_and_print_results(&searcher, &schema, query, "Keyword search for country 'USA'")?;
 
     // b. 分词查询
     let query = query_builder.smart_query("product_description", "search library")?;
     run_query_and_print_results(
         &searcher,
+        &schema,
         query,
         "Tokenized search for 'search library' in description",
     )?;
 
     // c. 数组中的精确匹配
     let query = query_builder.smart_query("user_tags", "rust")?;
-    run_query_and_print_results(&searcher, query, "Exact match for 'rust' in tags array")?;
+    run_query_and_print_results(
+        &searcher,
+        &schema,
+        query,
+        "Exact match for 'rust' in tags array",
+    )?;
 
     // d. 数值范围查询
     let query = query_builder.number_range_query_with_path("user_age", 25.0, 30.0)?;
-    run_query_and_print_results(&searcher, query, "Number range for age between 25 and 30")?;
+    run_query_and_print_results(
+        &searcher,
+        &schema,
+        query,
+        "Number range for age between 25 and 30",
+    )?;
 
     // e. 日期范围查询
     let query = query_builder
         .date_range_query_with_path("company_established_date", "2020-01-01", "2020-12-31")?;
     run_query_and_print_results(
         &searcher,
+        &schema,
         query,
         "Date range for establishment in year 2020",
     )?;
@@ -871,6 +915,7 @@ fn main() -> tantivy::Result<()> {
     let query = query_builder.ngram_query_with_path("product_description", "librar")?;
     run_query_and_print_results(
         &searcher,
+        &schema,
         query,
         "N-gram search for partial word 'librar' in 'product_description'",
     )?;
@@ -879,6 +924,7 @@ fn main() -> tantivy::Result<()> {
     let query = query_builder.number_range_query_with_path("metrics_downloads", 80.0, 90.0)?;
     run_query_and_print_results(
         &searcher,
+        &schema,
         query,
         "Number range for metrics_downloads between 80 and 90",
     )?;
@@ -894,6 +940,7 @@ fn main() -> tantivy::Result<()> {
     ]);
     run_query_and_print_results(
         &searcher,
+        &schema,
         Box::new(combined_query),
         "Combined range query for paper_year (2023) and test_wrong (140-150)",
     )?;
