@@ -1,89 +1,44 @@
-# Unleashing the Power of Your Data: Advanced JSON Search in TiCI
+# The Best of Both Worlds: High-Performance Search Meets Advanced SQL in TiDB with TiCI
 
 ## 1. Executive Summary
 
-We are excited to announce **planned support for advanced JSON indexing and search** within TiCI. This powerful new feature will empower you to unlock the full value of your semi-structured data. You will be able to store complex JSON objects in a single column and query any field with high performance, leveraging customizable text analysis and seamless integration with the standard SQL you already know and love.
+For customers accustomed to the search capabilities of systems like Elasticsearch, moving to a powerful distributed SQL database like TiDB presents a dilemma: how do you retain fast, flexible, text-oriented search while gaining the ability to perform complex analytical queries?
 
-This document provides a technical overview of the feature, its usage, and the underlying design principles.
+We are excited to introduce the answer: **native JSON indexing in TiCI**.
 
-## 2. How It Works: A High-Level View
+This feature is designed specifically for you. It bridges the gap between traditional search engines and analytical databases by integrating a powerful inverted index directly into TiDB's storage layer. With TiCI, you can index not only text but also **numeric, date, boolean, and array types** within your JSON documents. The result is a unified system that delivers the best of both worlds: the high-performance search you rely on and the sophisticated SQL analytics you need, all in one place.
 
-The new JSON functionality is built on two core processes: an intelligent indexing pipeline that deconstructs JSON for efficient storage, and a query execution path that translates standard SQL into fast index lookups.
+This document outlines our proposed design for this transformative feature.
 
-### Indexing: From Raw JSON to Searchable Fields
+## 2. A New Way to Query: Powerful, Intuitive, and SQL-Native
 
-When a JSON document is ingested, TiCI flattens it into a set of path-value pairs. Each pair is then mapped to a specific analyzer based on your rules, which tokenizes the value into searchable terms. This process ensures that data is stored optimally for the types of queries you need to run.
+To provide a clear and powerful interface, we propose a new set of SQL functions prefixed with `TICI_`. These functions act as markers, telling the TiDB query optimizer to delegate the work to TiCI's specialized index, ensuring maximum performance. This approach avoids the complex `MATCH...AGAINST` syntax and provides a more intuitive, SQL-native experience.
 
-**Diagram A: JSON Indexing Flow**
+### Proposed Functions:
 
-```mermaid
-graph TD
-    A["JSON Document<br/>{&quot;user_name&quot;: &quot;Alice&quot;, &quot;user_tags&quot;: [&quot;rust&quot;, &quot;db&quot;]}"] --> B{"Flatten to<br/>Path-Value Pairs"};
-    B --> C["user_name: &quot;Alice&quot;<br/>user_tags: &quot;rust&quot;<br/>user_tags: &quot;db&quot;"];
-    C --> D{"Analyzer Mapping"};
-    D -- "user_name path matches text rule" --> E["Apply Standard Analyzer"];
-    D -- "user_tags path matches tag rule" --> F["Apply Keyword Analyzer"];
-    E --> G["Token: 'user_name|alice'"];
-    F --> H["Tokens: 'user_tags|rust'<br/>'user_tags|db'"];
-    subgraph Inverted Index
-        G --> I[Searchable Terms]
-        H --> I
-    end
-```
+*   `TICI_MATCH(json_col, path, query_text)`: For all text-based searches, including term, phrase, and prefix matching.
+*   `TICI_RANGE(json_col, path)`: A marker for accelerating range queries on numeric and date fields using standard SQL operators (`>`, `<`, `BETWEEN`).
+*   `TICI_CONTAINS(json_col, path, value)`: Checks for the existence of a specific value in a JSON array.
+*   `TICI_EXISTS(json_col, path)`: A boolean function to check if a given JSON path exists and is not `null`.
 
-### Querying: Seamless Integration with SQL
-
-Your application interacts with the data using standard SQL. TiCI's full-text search functions (`fts_match_*`) are transparently accelerated by the new index. The TiCI query engine translates these functions into an optimized internal plan, executing them against the inverted index for maximum performance while other SQL predicates are handled by TiDB as usual.
-
-**Diagram B: Query Execution Pipeline**
-
-```mermaid
-graph TD
-    A["User SQL Query<br/>SELECT * FROM user_profile<br/>WHERE fts_match_word(data, 'tags', 'rust')<br/>AND JSON_EXTRACT(data, '$.age') &gt; 25"] --> B{"TiDB SQL Parser"};
-    B --> C{"fts_match_word(...) expression"};
-    C --> D["TiCI Query Translator"];
-    D --> E["Internal TermQuery<br/>'tags|rust'"];
-    B --> F{"JSON_EXTRACT(...) expression"};
-    F --> G["Standard TiDB Execution"];
-    subgraph "TiCI Internal Plan (BooleanQuery)"
-        E --> H{"MUST clause"};
-    end
-    H --> I["Inverted Index Lookup"];
-    subgraph TiDB
-        G --> J["Result Set Filtering"];
-    end
-    I --> J;
-    J --> K["Final Results"];
-```
-
-## 3. Core Capabilities
-
-*   **Flexible Indexing Schema**:
-    *   Define custom text-analysis rules for different JSON paths. You can apply full-text search to a product description, keyword analysis to a "tags" field, and prefix matching to a phone number—all within the same JSON object.
-    *   Layer multiple search behaviors (like full-text and prefix matching) on a single field to support diverse query patterns.
-
-*   **Rich Analyzer Support**:
-    *   **Standard Tokenizer**: For general-purpose text that needs to be broken down by whitespace and punctuation.
-    *   **N-gram Tokenizer**: Ideal for substring or prefix matching, commonly used for IDs, phone numbers, and codes.
-    *   **Keyword Tokenizer**: Treats the entire value as a single token, perfect for exact-match filtering on identifiers, status codes, or tags.
-
-*   **Powerful, Structured Filtering**:
-    *   Perform exact, full-text, or prefix matches on string fields.
-    *   Efficiently find values within string or numeric arrays.
-    *   Execute fast range queries on numbers and dates.
-    *   Combine multiple filter conditions seamlessly using standard SQL boolean logic (`AND`, `OR`, `NOT`).
-
-## 4. Usage in TiDB
-
-Getting started is simple. Define a `FULLTEXT` index on your `JSON` column, and you are ready to query.
+## 3. Usage and Examples
 
 ### 🔨 Table and Index Definition
 
+First, define a `FULLTEXT` index on your `JSON` column. The `COMMENT` clause is used to pass TiCI-specific configuration, such as custom analyzers for different JSON paths.
+
 ```sql
-CREATE TABLE user_profile (
+CREATE TABLE products (
   id BIGINT PRIMARY KEY,
   data JSON,
-  FULLTEXT INDEX idx_data (data)
+  FULLTEXT INDEX idx_product_data (data) COMMENT 'tici:{
+    "default_analyzer": "standard",
+    "path_configs": [
+      {"path": "$.product_code", "analyzer": "keyword"},
+      {"path": "$.title", "analyzer": "english_stemmer"},
+      {"path": "$.phone_numbers[*]", "analyzer": "edge_ngram_3_10"}
+    ]
+  }'
 );
 ```
 
@@ -91,111 +46,166 @@ CREATE TABLE user_profile (
 
 ```json
 {
-  "user_name": "Alice Smith",
-  "user_age": 28,
-  "user_tags": ["rust", "search", "database"],
-  "user_scores": [95, 87, 92],
-  "user_phone": "13812345678",
-  "user_languages": ["english", "chinese"],
-  "user_created_at": "2024-01-15T10:30:00Z"
+  "title": "Awesome Steel Bike",
+  "product_code": "BK-R93R-44",
+  "stock_level": 8,
+  "on_sale": true,
+  "tags": ["bicycle", "sports", "outdoors"],
+  "variants": [
+    {"sku": "BK-R93R-44-RD", "color": "red", "price": 1099.99},
+    {"sku": "BK-R93R-44-BL", "color": "blue", "price": 1149.99}
+  ],
+  "phone_numbers": ["13812345678", "15987654321"],
+  "release_date": "2023-05-01T10:00:00Z"
 }
 ```
 
 ### 🔍 Query Examples
 
-All filters are processed via standard TiDB SQL semantics. TiCI transparently accelerates the `fts_match_*` expressions using its specialized index, without altering SQL's behavior.
+#### 1. Text Search with Sorting and Pagination
 
-#### 1. Single field match
-
-```sql
-SELECT * FROM user_profile
-WHERE fts_match_word(data, 'user_name', 'Alice');
-```
-
-#### 2. Keyword match in a string array
+Find products matching "bike", order by release date, and return the top 10. The `ORDER BY` on `release_date` is accelerated by TiCI.
 
 ```sql
-SELECT COUNT(*) FROM user_profile
-WHERE fts_match_word(data, 'user_tags', 'database');
+SELECT id, data->>'$.title'
+FROM products
+WHERE TICI_MATCH(data, '$.title', 'bike')
+ORDER BY data->>'$.release_date' DESC
+LIMIT 10;
 ```
 
-#### 3. Prefix match on phone number
+#### 2. Combined Exact Match and Range Filter
+
+Find bikes in stock that are not on sale. Both conditions are pushed down to TiCI.
 
 ```sql
-SELECT * FROM user_profile
-WHERE fts_match_prefix(data, 'user_phone', '1381234');
+SELECT * FROM products
+WHERE TICI_MATCH(data, '$.on_sale', 'false')
+  AND TICI_RANGE(data, '$.stock_level') > 0;
 ```
 
-#### 4. Combined filters
+#### 3. Searching within an Array (`NOT IN` equivalent)
+
+Find products tagged "sports" but not "outdoors".
 
 ```sql
-SELECT * FROM user_profile
-WHERE fts_match_word(data, 'user_tags', 'rust')
-  AND fts_match_word(data, 'user_languages', 'english')
-  AND fts_match_prefix(data, 'user_phone', '138')
-  AND JSON_EXTRACT(data, '$.user_age') BETWEEN 25 AND 35;
+SELECT * FROM products
+WHERE TICI_CONTAINS(data, '$.tags', 'sports')
+  AND NOT TICI_CONTAINS(data, '$.tags', 'outdoors');
 ```
 
-## 5. Under the Hood: Advanced Details
+#### 4. Checking for NULL values
 
-### How Tokenization Works
+Find products where the `product_code` field exists and is not null.
 
-At the core of the indexing process is a set of customizable tokenizers. TiCI prefixes each generated token with its full JSON path to ensure queries are precise. For example, a search for `alice` against the `user_name` field will not accidentally match a value in a different field.
+```sql
+SELECT * FROM products
+WHERE TICI_EXISTS(data, '$.product_code');
+```
 
-**Diagram C: Tokenizer Output Comparison**
-The choice of analyzer dramatically changes how data is indexed and searched.
+#### 5. Prefix Search on an Array of Strings
 
+Find a product by the prefix of a phone number.
+
+```sql
+SELECT * FROM products
+WHERE TICI_MATCH(data, '$.phone_numbers', '138123*'); -- Using prefix wildcard
+```
+
+---
+
+## 4. Under the Hood: The Internal Design
+
+### The Indexing Pipeline
+
+TiCI processes JSON by flattening it into path-value pairs. Based on your configuration, it applies specific analyzers to each path, converting values into indexed terms for fast retrieval. This indexing process is the key to accelerating queries on all data types.
+
+**Diagram A: The Indexing Pipeline**
 ```mermaid
 graph TD
-    subgraph Input Value
-        A["user_phone: '13812345678'"]
+    A["JSON Document"] --> B{"Flatten to Path-Value Pairs"};
+    subgraph "Path-Value Pairs"
+        C["'$.title': 'Awesome Steel Bike'"]
+        D["'$.stock_level': 8"]
+        E["'$.tags[0]': 'bicycle'"]
     end
+    B --> C & D & E
 
-    A --> B{"Select Analyzer"};
+    C --> F{"Analyzer Mapping<br/>(User Config)"};
+    D --> F;
+    E --> F;
 
-    subgraph "Keyword Analyzer (for Exact Match)"
-        B -- "path rule: keyword" --> K["Single Token:<br/>'user_phone|13812345678'"]
-    end
+    F -- "$.title -> 'english_stemmer'" --> G["Tokens:<br/>'awesom', 'steel', 'bike'"]
+    F -- "$.stock_level -> (numeric)" --> H["Indexed as Number<br/>(for range/sort)"]
+    F -- "Default -> 'standard'" --> I["Token:<br/>'bicycle'"]
 
-    subgraph "Standard Analyzer (for General Text)"
-        B -- "path rule: standard" --> S["Single Token:<br/>'user_phone|13812345678'"]
-    end
-
-    subgraph "N-gram Analyzer (for Prefix/Substring Match)"
-        B -- "path rule: ngram(3)" --> N["Multiple Tokens:<br/>'user_phone|138'<br/>'user_phone|381'<br/>'user_phone|812'<br/>'...'"]
+    subgraph "TiCI Inverted & Columnar Index"
+        G --> J[Indexed Terms]
+        H --> J
+        I --> J
     end
 ```
 
-### Indexing Logic
+### The Query Execution Pipeline
 
-1.  **Flatten JSON**: The input document is deconstructed into a flat list of key-value pairs, where the key is the full JSON path.
-2.  **Apply Dynamic Templates**: TiCI matches each path against your configured templates to select the right analyzer.
-3.  **Default Logic**: If no template matches a path, a default analyzer is chosen based on the value type:
-    *   Text with whitespace/punctuation → **Standard Analyzer**.
-    *   Identifier-like strings → **Keyword Analyzer**.
-    *   Date-like strings → Parsed as a timestamp for range queries.
-    *   Numeric values → Encoded for fast term and range queries.
+When you run a query using `TICI_*` functions, the TiDB optimizer recognizes them and rewrites the plan to delegate the filtering work to TiCI. **Crucially, this includes range filters and sorting**, which are executed efficiently on the TiCI index, not on the TiDB level.
 
-### Query Logic
+**Diagram B: The Query Pipeline**
+```mermaid
+graph TD
+    A["User SQL Query<br/>SELECT ...<br/>WHERE TICI_MATCH(data, '$.title', 'bike')<br/>AND TICI_RANGE(data, '$.stock_level') > 5"] --> B{"TiDB SQL Parser"};
+    
+    subgraph "TiDB Optimizer"
+      B --> C{"TICI_MATCH expression"};
+      B --> D{"TICI_RANGE expression"};
+    end
+    
+    C & D --> E["<strong>TiCI Query Translator</strong>"];
+    
+    E -- "text match" --> F["Internal TermQuery<br/>'title|bike'"];
+    E -- "range filter" --> G["Internal RangeQuery<br/>'stock_level > 5'"];
 
-Internally, TiCI translates `fts_match_*` calls into a `BooleanQuery` that combines different term, range, and prefix filters using `MUST`, `SHOULD`, and `MUST_NOT` clauses. For example:
-
-```rust
-// SQL: WHERE fts_match_word(data, 'user_tags', 'rust')
-//      AND fts_match_word(data, 'user_languages', 'english')
-
-BooleanQuery {
-  subqueries: [
-    (Must, TermQuery(term: "user_tags|rust")),
-    (Must, TermQuery(term: "user_languages|english")),
-  ]
-}
+    subgraph "TiCI Internal Plan (BooleanQuery)"
+        F --> H{MUST clause};
+        G --> H;
+    end
+    
+    H --> I[Inverted Index Lookup];
+    I --> J[<B>Final Results</B>];
 ```
 
-## 6. Design Considerations (Current Limitations)
+### Understanding Analyzers
 
-To deliver a robust and performant feature, we have made specific design choices.
+The choice of analyzer is critical for defining *how* a field can be searched.
 
-*   **Flattened Data Model**: The index "flattens" arrays of objects. This means parent-child relationships within a nested structure are not preserved in the index, which can lead to false positives when querying across multiple fields of a nested object. For example, if you have `[{product: "A", color: "red"}, {product: "B", color: "blue"}]`, a query for `product: "A" AND color: "blue"` would match.
+**Diagram C: Analyzer Comparison for "Awesome Steel Bike"**
+```mermaid
+graph TD
+    A["Input Text:<br/>'Awesome Steel Bike'"]
+
+    subgraph "Keyword Analyzer (Exact Match)"
+        A --> B["One Token:<br/>'Awesome Steel Bike'"]
+    end
+
+    subgraph "Standard Analyzer (Full-Text Search)"
+        A --> C["Tokens:<br/>'awesome', 'steel', 'bike'"]
+    end
+
+    subgraph "Edge N-gram Analyzer (Prefix Search)"
+        A --> D["Tokens:<br/>'a', 'aw', 'awe', 'awes', ...<br/>'s', 'st', 'ste', 'stee', ...<br/>'b', 'bi', 'bik', 'bike'"]
+    end
+```
+
+### Indexing for Performance: Beyond Text
+
+For numeric, date, and boolean fields, TiCI does more than just create searchable terms. These values are stored in a highly optimized columnar format similar to a B-Tree. This structure allows TiCI to perform two operations with extreme speed:
+*   **Exact Matches**: Finding a specific value (e.g., `stock_level = 8`).
+*   **Range Scans**: Efficiently retrieving all documents within a range (e.g., `stock_level > 5`).
+
+This is why `TICI_RANGE` and sorting operations on these fields are significantly faster than full table scans in TiDB.
+
+## 5. Design Considerations (Current Limitations)
+
+*   **Flattened Data Model**: The index "flattens" arrays of objects. This means parent-child relationships within a nested structure are not preserved in the index, which can lead to false positives when querying across multiple fields of a nested object. For example, if you have `variants: [{color: "red", size: "L"}, {color: "blue", size: "M"}]`, a query for `color: "red" AND size: "M"` would match.
 
 *   **Static Type Inference**: The type of a field (e.g., text, number) is inferred during the first ingestion and remains fixed. A field that contains both `"123"` and `123` will be treated as either text or numeric based on the first value seen, and subsequent documents must conform. 
