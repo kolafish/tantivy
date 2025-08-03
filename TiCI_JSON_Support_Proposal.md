@@ -6,20 +6,20 @@ For customers accustomed to the search capabilities of systems like Elasticsearc
 
 We are excited to introduce the answer: **native JSON indexing in TiCI**.
 
-This feature is designed specifically for you. It bridges the gap between traditional search engines and analytical databases by integrating a powerful inverted index directly into TiDB's storage layer. With TiCI, you can index not only text but also **numeric, date, boolean, and array types** within your JSON documents. The result is a unified system that delivers the best of both worlds: the high-performance search you rely on and the sophisticated SQL analytics you need, all in one place.
+This feature is designed specifically for you. It extends TiCI's powerful indexing capabilities—which already support text, numeric, date, boolean, and array types—to the fields within your JSON documents. The result is a unified system that delivers the best of both worlds: the high-performance search you rely on and the sophisticated SQL analytics you need, all in one place.
 
 This document outlines our proposed design for this transformative feature.
 
-## 2. A New Way to Query: Powerful, Intuitive, and SQL-Native
+## 2. A Powerful and SQL-Native Query Interface
 
-To provide a clear and powerful interface, we propose a new set of SQL functions prefixed with `TICI_`. These functions act as markers, telling the TiDB query optimizer to delegate the work to TiCI's specialized index, ensuring maximum performance. This approach avoids the complex `MATCH...AGAINST` syntax and provides a more intuitive, SQL-native experience.
+To provide a clear and powerful interface that feels native to the TiDB/MySQL ecosystem, we will enhance the existing `fts_match` family of functions. These functions act as markers, telling the TiDB query optimizer to delegate the work to TiCI's specialized index, ensuring maximum performance.
 
 ### Proposed Functions:
 
-*   `TICI_MATCH(json_col, path, query_text)`: For all text-based searches, including term, phrase, and prefix matching.
-*   `TICI_RANGE(json_col, path)`: A marker for accelerating range queries on numeric and date fields using standard SQL operators (`>`, `<`, `BETWEEN`).
-*   `TICI_CONTAINS(json_col, path, value)`: Checks for the existence of a specific value in a JSON array.
-*   `TICI_EXISTS(json_col, path)`: A boolean function to check if a given JSON path exists and is not `null`.
+*   `fts_match(json_col, path, query_text)`: The primary function for term and phrase matching.
+*   `fts_match_prefix(json_col, path, prefix_text)`: For dedicated prefix matching.
+*   `fts_range(json_col, path)`: A marker for accelerating range queries on numeric and date fields. It is used in conjunction with standard SQL operators (`>`, `<`, `BETWEEN`).
+*   `fts_exists(json_col, path)`: A boolean function to check if a given JSON path exists and is not `null`.
 
 ## 3. Usage and Examples
 
@@ -51,10 +51,6 @@ CREATE TABLE products (
   "stock_level": 8,
   "on_sale": true,
   "tags": ["bicycle", "sports", "outdoors"],
-  "variants": [
-    {"sku": "BK-R93R-44-RD", "color": "red", "price": 1099.99},
-    {"sku": "BK-R93R-44-BL", "color": "blue", "price": 1149.99}
-  ],
   "phone_numbers": ["13812345678", "15987654321"],
   "release_date": "2023-05-01T10:00:00Z"
 }
@@ -69,7 +65,7 @@ Find products matching "bike", order by release date, and return the top 10. The
 ```sql
 SELECT id, data->>'$.title'
 FROM products
-WHERE TICI_MATCH(data, '$.title', 'bike')
+WHERE fts_match(data, '$.title', 'bike')
 ORDER BY data->>'$.release_date' DESC
 LIMIT 10;
 ```
@@ -80,8 +76,8 @@ Find bikes in stock that are not on sale. Both conditions are pushed down to TiC
 
 ```sql
 SELECT * FROM products
-WHERE TICI_MATCH(data, '$.on_sale', 'false')
-  AND TICI_RANGE(data, '$.stock_level') > 0;
+WHERE fts_match(data, '$.on_sale', 'false')
+  AND fts_range(data, '$.stock_level') > 0;
 ```
 
 #### 3. Searching within an Array (`NOT IN` equivalent)
@@ -90,8 +86,8 @@ Find products tagged "sports" but not "outdoors".
 
 ```sql
 SELECT * FROM products
-WHERE TICI_CONTAINS(data, '$.tags', 'sports')
-  AND NOT TICI_CONTAINS(data, '$.tags', 'outdoors');
+WHERE fts_match(data, '$.tags', 'sports')
+  AND NOT fts_match(data, '$.tags', 'outdoors');
 ```
 
 #### 4. Checking for NULL values
@@ -100,7 +96,7 @@ Find products where the `product_code` field exists and is not null.
 
 ```sql
 SELECT * FROM products
-WHERE TICI_EXISTS(data, '$.product_code');
+WHERE fts_exists(data, '$.product_code');
 ```
 
 #### 5. Prefix Search on an Array of Strings
@@ -109,7 +105,7 @@ Find a product by the prefix of a phone number.
 
 ```sql
 SELECT * FROM products
-WHERE TICI_MATCH(data, '$.phone_numbers', '138123*'); -- Using prefix wildcard
+WHERE fts_match_prefix(data, '$.phone_numbers', '138123');
 ```
 
 ---
@@ -148,16 +144,16 @@ graph TD
 
 ### The Query Execution Pipeline
 
-When you run a query using `TICI_*` functions, the TiDB optimizer recognizes them and rewrites the plan to delegate the filtering work to TiCI. **Crucially, this includes range filters and sorting**, which are executed efficiently on the TiCI index, not on the TiDB level.
+When you run a query using `fts_*` functions, the TiDB optimizer recognizes them and rewrites the plan to delegate the filtering work to TiCI. **Crucially, this includes range filters and sorting**, which are executed efficiently on the TiCI index, not on the TiDB level.
 
 **Diagram B: The Query Pipeline**
 ```mermaid
 graph TD
-    A["User SQL Query<br/>SELECT ...<br/>WHERE TICI_MATCH(data, '$.title', 'bike')<br/>AND TICI_RANGE(data, '$.stock_level') > 5"] --> B{"TiDB SQL Parser"};
+    A["User SQL Query<br/>SELECT ...<br/>WHERE fts_match(data, '$.title', 'bike')<br/>AND fts_range(data, '$.stock_level') > 5"] --> B{"TiDB SQL Parser"};
     
     subgraph "TiDB Optimizer"
-      B --> C{"TICI_MATCH expression"};
-      B --> D{"TICI_RANGE expression"};
+      B --> C{"fts_match expression"};
+      B --> D{"fts_range expression"};
     end
     
     C & D --> E["<strong>TiCI Query Translator</strong>"];
@@ -202,7 +198,7 @@ For numeric, date, and boolean fields, TiCI does more than just create searchabl
 *   **Exact Matches**: Finding a specific value (e.g., `stock_level = 8`).
 *   **Range Scans**: Efficiently retrieving all documents within a range (e.g., `stock_level > 5`).
 
-This is why `TICI_RANGE` and sorting operations on these fields are significantly faster than full table scans in TiDB.
+This is why `fts_range` and sorting operations on these fields are significantly faster than full table scans in TiDB.
 
 ## 5. Design Considerations (Current Limitations)
 
