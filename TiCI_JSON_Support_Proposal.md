@@ -4,9 +4,9 @@
 
 For customers accustomed to the search capabilities of systems like Elasticsearch, moving to a powerful distributed SQL database like TiDB presents a dilemma: how do you retain fast, flexible, text-oriented search while gaining the ability to perform complex analytical queries?
 
-We are excited to introduce the answer: **native JSON indexing in TiCI**.
+We are excited to introduce the next evolution of TiCI: **native JSON indexing and expanded type support**.
 
-This feature is designed specifically for you. It extends TiCI's powerful indexing capabilities—which already support text, numeric, date, boolean, and array types—to the fields within your JSON documents. The result is a unified system that delivers the best of both worlds: the high-performance search you rely on and the sophisticated SQL analytics you need, all in one place.
+Currently, TiCI provides powerful text-search capabilities. In our upcoming version, we are extending this power to structured data. This initiative makes **native JSON support** a headline feature, allowing you to index and query fields within your JSON documents. This enhancement also brings official support for indexing standalone **numeric, date, and boolean types** with the same high performance. The result is a unified system that delivers the best of both worlds: the high-performance search you rely on and the sophisticated SQL analytics you need, all in one place.
 
 This document outlines our proposed design for this transformative feature.
 
@@ -16,7 +16,7 @@ To provide a clear and powerful interface that feels native to the TiDB/MySQL ec
 
 ### Proposed Functions:
 
-*   `fts_match(json_col, path, query_text)`: The primary function for term and phrase matching.
+*   `fts_match_word(json_col, path, query_text)`: The primary function for single-term matching.
 *   `fts_match_prefix(json_col, path, prefix_text)`: For dedicated prefix matching.
 *   `fts_range(json_col, path)`: A marker for accelerating range queries on numeric and date fields. It is used in conjunction with standard SQL operators (`>`, `<`, `BETWEEN`).
 *   `fts_exists(json_col, path)`: A boolean function to check if a given JSON path exists and is not `null`.
@@ -65,7 +65,7 @@ Find products matching "bike", order by release date, and return the top 10. The
 ```sql
 SELECT id, data->>'$.title'
 FROM products
-WHERE fts_match(data, '$.title', 'bike')
+WHERE fts_match_word(data, '$.title', 'bike')
 ORDER BY data->>'$.release_date' DESC
 LIMIT 10;
 ```
@@ -76,7 +76,7 @@ Find bikes in stock that are not on sale. Both conditions are pushed down to TiC
 
 ```sql
 SELECT * FROM products
-WHERE fts_match(data, '$.on_sale', 'false')
+WHERE fts_match_word(data, '$.on_sale', 'false')
   AND fts_range(data, '$.stock_level') > 0;
 ```
 
@@ -86,8 +86,8 @@ Find products tagged "sports" but not "outdoors".
 
 ```sql
 SELECT * FROM products
-WHERE fts_match(data, '$.tags', 'sports')
-  AND NOT fts_match(data, '$.tags', 'outdoors');
+WHERE fts_match_word(data, '$.tags', 'sports')
+  AND NOT fts_match_word(data, '$.tags', 'outdoors');
 ```
 
 #### 4. Checking for NULL values
@@ -106,6 +106,21 @@ Find a product by the prefix of a phone number.
 ```sql
 SELECT * FROM products
 WHERE fts_match_prefix(data, '$.phone_numbers', '138123');
+```
+
+#### 6. Complex Combined Query
+
+Find outdoor products that are on sale, have a stock level between 5 and 20, and have a product code that starts with "BK-". Order the results by most recently released.
+
+```sql
+SELECT id, data->>'$.title', data->>'$.stock_level'
+FROM products
+WHERE
+  fts_match_word(data, '$.tags', 'outdoors')
+  AND fts_match_word(data, '$.on_sale', 'true')
+  AND fts_match_prefix(data, '$.product_code', 'BK-')
+  AND fts_range(data, '$.stock_level') BETWEEN 5 AND 20
+ORDER BY data->>'$.release_date' DESC;
 ```
 
 ---
@@ -149,10 +164,10 @@ When you run a query using `fts_*` functions, the TiDB optimizer recognizes them
 **Diagram B: The Query Pipeline**
 ```mermaid
 graph TD
-    A["User SQL Query<br/>SELECT ...<br/>WHERE fts_match(data, '$.title', 'bike')<br/>AND fts_range(data, '$.stock_level') > 5"] --> B{"TiDB SQL Parser"};
+    A["User SQL Query<br/>SELECT ...<br/>WHERE fts_match_word(data, '$.title', 'bike')<br/>AND fts_range(data, '$.stock_level') > 5"] --> B{"TiDB SQL Parser"};
     
     subgraph "TiDB Optimizer"
-      B --> C{"fts_match expression"};
+      B --> C{"fts_match_word expression"};
       B --> D{"fts_range expression"};
     end
     
@@ -194,14 +209,22 @@ graph TD
 
 ### Indexing for Performance: Beyond Text
 
-For numeric, date, and boolean fields, TiCI does more than just create searchable terms. These values are stored in a highly optimized columnar format similar to a B-Tree. This structure allows TiCI to perform two operations with extreme speed:
-*   **Exact Matches**: Finding a specific value (e.g., `stock_level = 8`).
-*   **Range Scans**: Efficiently retrieving all documents within a range (e.g., `stock_level > 5`).
+For numeric, date, and boolean fields, TiCI employs a sophisticated two-part strategy to deliver high performance for both filtering and sorting.
 
-This is why `fts_range` and sorting operations on these fields are significantly faster than full table scans in TiDB.
+1.  **Inverted Index for Fast Filtering**: All values, including numbers and dates, are first converted into a comparable byte-encoded format and placed into TiCI's inverted index. This allows the full power of the inverted index to be used for these types.
+    *   **Exact Matches** (e.g., `stock_level = 8`) become fast term lookups.
+    *   **Range Scans** (e.g., `stock_level > 5`) become efficient range lookups on the terms in the inverted index.
+
+2.  **Columnar Store for Fast Sorting**: When a query requires sorting (`ORDER BY`) on a numeric or date field, retrieving values one by one from the inverted index would be inefficient. To solve this, TiCI maintains a separate, auxiliary **columnar store** for these fields. This is a simple data structure that stores the values sequentially and can be accessed directly by a document's internal ID. After the inverted index has rapidly filtered the documents down to a small result set, this columnar store provides a high-speed path to retrieve the values needed for the final sort.
+
+This dual approach ensures that both filtering and sorting operations are executed with maximum efficiency.
 
 ## 5. Design Considerations (Current Limitations)
 
 *   **Flattened Data Model**: The index "flattens" arrays of objects. This means parent-child relationships within a nested structure are not preserved in the index, which can lead to false positives when querying across multiple fields of a nested object. For example, if you have `variants: [{color: "red", size: "L"}, {color: "blue", size: "M"}]`, a query for `color: "red" AND size: "M"` would match.
 
-*   **Static Type Inference**: The type of a field (e.g., text, number) is inferred during the first ingestion and remains fixed. A field that contains both `"123"` and `123` will be treated as either text or numeric based on the first value seen, and subsequent documents must conform. 
+*   **Static Type Inference**: The type of a field (e.g., text, number) is inferred during the first ingestion and remains fixed. A field that contains both `"123"` and `123` will be treated as either text or numeric based on the first value seen, and subsequent documents must conform.
+
+*   **No Phrase Matching**: The initial version will support single-term matching via `fts_match_word`. Support for multi-term phrase queries is planned for a future release.
+
+*   **No Relevance-Based Scoring**: Queries are based on boolean matching, not relevance scoring. There is no support for ordering results by a relevance score like TF-IDF or BM25. 
