@@ -1,4 +1,4 @@
-# The Best of Both Worlds: High-Performance Search Meets Advanced SQL in TiDB with TiCI
+# Native JSON Indexing in TiDB with TiCI
 
 ## 1. Executive Summary
 
