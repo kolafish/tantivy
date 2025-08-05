@@ -202,9 +202,9 @@ graph TD
 
         subgraph Translate_Subgraph ["A. Translate each condition to a Tantivy Query"]
             direction TD
-            C["fts_match_word('$.tags', 'outdoors')"] --> C_Out["TermQuery on <b>text_raw</b><br/>Term: 'tags__outdoors'"]
-            D["fts_match_word('$.tags', 'sports')"] --> D_Out["TermQuery on <b>text_raw</b><br/>Term: 'tags__sports'"]
-            E["fts_match_word('$.on_sale', 'true')"] --> E_Out["TermQuery on <b>bytes_field</b><br/>Term: 'on_sale__true'"]
+            C["fts_match_word(&apos;$.tags&apos;, &apos;outdoors&apos;)"] --> C_Out["TermQuery on <b>text_raw</b><br/>Term: 'tags__outdoors'"]
+            D["fts_match_word(&apos;$.tags&apos;, &apos;sports&apos;)"] --> D_Out["TermQuery on <b>text_raw</b><br/>Term: 'tags__sports'"]
+            E["fts_match_word(&apos;$.on_sale&apos;, &apos;true&apos;)"] --> E_Out["TermQuery on <b>bytes_field</b><br/>Term: 'on_sale__true'"]
             F["NOT fts_match_prefix(...)"] --> F_Out["PrefixQuery on <b>text_raw</b><br/>Prefix: 'product_code__BK-'"]
         end
 
@@ -213,17 +213,17 @@ graph TD
         G --> H["
         {<br/>
           &nbsp;&nbsp;<b>MUST:</b> [<br/>
-        &nbsp;&nbsp;&nbsp;&nbsp;{ TermQuery(on_sale__true) },<br/>
+        &nbsp;&nbsp;&nbsp;&nbsp;{ TermQuery for &apos;on_sale__true&apos; },<br/>
         &nbsp;&nbsp;&nbsp;&nbsp;{ BooleanQuery: {<br/>
         &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<b>SHOULD:</b> [<br/>
-        &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;{ TermQuery(tags__outdoors) },<br/>
-        &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;{ TermQuery(tags__sports) }<br/>
+        &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;{ TermQuery for &apos;tags__outdoors&apos; },<br/>
+        &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;{ TermQuery for &apos;tags__sports&apos; }<br/>
         &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;],<br/>
         &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;minimum_should_match: 1<br/>
         &nbsp;&nbsp;&nbsp;&nbsp;}}<br/>
           &nbsp;&nbsp;],<br/>
           &nbsp;&nbsp;<b>MUST_NOT:</b> [<br/>
-        &nbsp;&nbsp;&nbsp;&nbsp;{ PrefixQuery(product_code__BK-) }<br/>
+        &nbsp;&nbsp;&nbsp;&nbsp;{ PrefixQuery for &apos;product_code__BK-&apos; }<br/>
           &nbsp;&nbsp;]<br/>
         }
         "]
