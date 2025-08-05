@@ -210,11 +210,7 @@ graph TD
 
         G --> H["{<br/>
           &nbsp;&nbsp;<b>MUST:</b> [ { TermQuery for 'on_sale__true' },<br/>
-            &nbsp;&nbsp;&nbsp;&nbsp;{ BooleanQuery: {<br/>
-              &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<b>SHOULD:</b> [ {TermQuery 'tags__outdoors'}, {TermQuery 'tags__sports'} ],<br/>
-              &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;minimum_should_match: 1<br/>
-            &nbsp;&nbsp;&nbsp;&nbsp;} }<br/>
-          ],<br/>
+            &nbsp;&nbsp;&nbsp;&nbsp;{ BooleanQuery: { <b>SHOULD:</b> ['tags__outdoors', 'tags__sports'], min_should_match: 1 } } ],<br/>
           &nbsp;&nbsp;<b>MUST_NOT:</b> [ { PrefixQuery for 'product_code__BK-' } ]<br/>
         }"]
         
