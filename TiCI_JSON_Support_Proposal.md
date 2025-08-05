@@ -134,26 +134,43 @@ TiCI processes JSON by flattening it into path-value pairs. Based on your config
 **Diagram A: The Indexing Pipeline**
 ```mermaid
 graph TD
-    A["JSON Document"] --> B{"Flatten to Path-Value Pairs"};
-    subgraph "Path-Value Pairs"
-        C["'$.title': 'Awesome Steel Bike'"]
-        D["'$.stock_level': 8"]
-        E["'$.tags[0]': 'bicycle'"]
+    A["JSON Document"] --> B{"Flatten to<br/>Path-Value Pairs"};
+    
+    subgraph "Example Path-Value Pairs"
+        C["'$.title':<br/>'Awesome Steel Bike'"]
+        D["'$.stock_level':<br/>8"]
+        E["'$.on_sale':<br/>true"]
+        F["'$.product_code':<br/>'BK-R93R-44'"]
     end
-    B --> C & D & E
+    B --> C & D & E & F
 
-    C --> F{"Analyzer Mapping<br/>(User Config)"};
-    D --> F;
-    E --> F;
+    C --> G{"Automatic Mapping Logic<br/>(based on value type and path config)"}
+    D --> G
+    E --> G
+    F --> G
 
-    F -- "$.title -> 'english_stemmer'" --> G["Tokens:<br/>'awesom', 'steel', 'bike'"]
-    F -- "$.stock_level -> (numeric)" --> H["Indexed as Number<br/>(for range/sort)"]
-    F -- "Default -> 'standard'" --> I["Token:<br/>'bicycle'"]
+    subgraph "Tantivy Index with Fixed Internal Fields"
+        direction TB
+        subgraph "Text Fields"
+            H["<b>text_analyzed</b><br>(For full-text search)"]
+            I["<b>text_raw</b><br>(For keywords, booleans)"]
+        end
+        subgraph "Typed Fields (for range/sort)"
+            J["<b>number_field</b>"]
+            K["<b>date_field</b>"]
+        end
+    end
+    
+    G -- "'$.title' is Analyzed Text" --> H
+    G -- "'$.product_code' is Keyword" --> I
+    G -- "'$.stock_level' is Number" --> J
+    G -- "'$.on_sale' is Boolean" --> I
 
-    subgraph "TiCI Inverted & Columnar Index"
-        G --> J[Indexed Terms]
-        H --> J
-        I --> J
+    subgraph "Indexed Terms (Path + Value)"
+        H ==> L["'title__awesom', 'title__steel', ..."]
+        I ==> M["'product_code__BK-R93R-44'"]
+        J ==> N["'stock_level__' + encoded(8)"]
+        I ==> O["'on_sale__true'"]
     end
 ```
 
@@ -164,25 +181,29 @@ When you run a query using `fts_*` functions, the TiDB optimizer recognizes them
 **Diagram B: The Query Pipeline**
 ```mermaid
 graph TD
-    A["User SQL Query<br/>SELECT ...<br/>WHERE fts_match_word(data, '$.title', 'bike')<br/>AND fts_range(data, '$.stock_level') > 5"] --> B{"TiDB SQL Parser"};
+    A["User SQL Query<br/>WHERE fts_match_word(data, '$.title', 'bike')<br/>AND fts_range(data, '$.stock_level') > 5"] --> B{"TiDB SQL Parser & Optimizer"};
     
-    subgraph "TiDB Optimizer"
-      B --> C{"fts_match_word expression"};
-      B --> D{"fts_range expression"};
-    end
-    
-    C & D --> E["<strong>TiCI Query Translator</strong>"];
-    
-    E -- "text match" --> F["Internal TermQuery<br/>'title|bike'"];
-    E -- "range filter" --> G["Internal RangeQuery<br/>'stock_level > 5'"];
+    B --> C{"TiDB detects <b>fts_...</b> functions<br/>and delegates to TiCI"};
 
-    subgraph "TiCI Internal Plan (BooleanQuery)"
-        F --> H{MUST clause};
-        G --> H;
+    subgraph "TiCI Query Translator"
+        direction LR
+        C -- "fts_match_word('$.title', 'bike')" --> D{"1. Determine Target Field<br>Path '$.title' is text -> <b>text_analyzed</b>"}
+        C -- "fts_range('$.stock_level') > 5" --> E{"2. Determine Target Field<br>Path '$.stock_level' is numeric -> <b>number_field</b>"}
+    end
+
+    subgraph "Build Internal Tantivy Query"
+        direction LR
+        D -- "Construct TermQuery" --> F["TermQuery on <b>text_analyzed</b><br>Term: 'title__bike'"]
+        E -- "Construct RangeQuery" --> G["RangeQuery on <b>number_field</b><br>Range: ('stock_level__' + encoded(5), ... )"]
     end
     
-    H --> I[Inverted Index Lookup];
-    I --> J[<B>Final Results</B>];
+    subgraph "TiCI Internal Plan (BooleanQuery)"
+        F --> H{MUST clause}
+        G --> H
+    end
+    
+    H --> I["Search on Fixed Schema Index"];
+    I --> J["<B>Final Doc IDs</B>"];
 ```
 
 ### Understanding Analyzers
