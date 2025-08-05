@@ -189,10 +189,10 @@ graph TD
 
 When you run a query using `fts_*` functions, the TiDB optimizer recognizes them and rewrites the plan to delegate the filtering work to TiCI. **Crucially, this includes range filters and sorting**, which are executed efficiently on the TiCI index, not on the TiDB level.
 
-**Diagram B: The Query Pipeline (based on Query Example #6)**
+**Diagram B: The Query Pipeline (based on a complex query with mixed boolean logic)**
 ```mermaid
 graph TD
-    A["<b>User SQL Query (Example #6)</b><br/>...<br/>WHERE ...<br/>ORDER BY data->>'$.release_date' DESC"]
+    A["<b>User SQL Query (Complex Example)</b><br/>WHERE (fts_match_word(tags, 'outdoors') OR fts_match_word(tags, 'sports'))<br/>  AND fts_match_word(on_sale, 'true')<br/>  AND NOT fts_match_prefix(product_code, 'BK-')"]
 
     A --> Step1_Subgraph
     A -- "ORDER BY clause" --> Step2_Subgraph
@@ -201,24 +201,37 @@ graph TD
         direction TB
 
         subgraph Translate_Subgraph ["A. Translate each condition to a Tantivy Query"]
-            direction LR
-            C["fts_match_word('$.tags', ...)<br/>(path is keyword)"] --> C_Out["TermQuery on <b>text_raw</b>"]
-            D["fts_match_prefix('$.product_code', ...)<br/>(path is keyword)"] --> D_Out["PrefixQuery on <b>text_raw</b>"]
-            E["fts_range('$.stock_level', ...)<br/>(path is numeric)"] --> E_Out["RangeQuery on <b>number_field</b>"]
+            direction TD
+            C["fts_match_word('$.tags', 'outdoors')"] --> C_Out["TermQuery on <b>text_raw</b><br/>Term: 'tags__outdoors'"]
+            D["fts_match_word('$.tags', 'sports')"] --> D_Out["TermQuery on <b>text_raw</b><br/>Term: 'tags__sports'"]
+            E["fts_match_word('$.on_sale', 'true')"] --> E_Out["TermQuery on <b>bytes_field</b><br/>Term: 'on_sale__true'"]
+            F["NOT fts_match_prefix(...)"] --> F_Out["PrefixQuery on <b>text_raw</b><br/>Prefix: 'product_code__BK-'"]
         end
 
-        Translate_Subgraph --> G["<b>B. Combine into a single BooleanQuery</b><br/>(all with MUST clause)"]
+        Translate_Subgraph --> G["<b>B. Combine into a nested BooleanQuery</b>"]
         
-        G --> H["<b>C. Execute Filter against Inverted Index</b><br/>(produces a set of matching doc IDs)"]
+        G --> H["
+        {<br/>
+          &nbsp;&nbsp;<b>MUST:</b> [<br/>
+        &nbsp;&nbsp;&nbsp;&nbsp;{ TermQuery(on_sale__true) },<br/>
+        &nbsp;&nbsp;&nbsp;&nbsp;{ BooleanQuery: {<br/>
+        &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<b>SHOULD:</b> [<br/>
+        &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;{ TermQuery(tags__outdoors) },<br/>
+        &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;{ TermQuery(tags__sports) }<br/>
+        &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;],<br/>
+        &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;minimum_should_match: 1<br/>
+        &nbsp;&nbsp;&nbsp;&nbsp;}}<br/>
+          &nbsp;&nbsp;],<br/>
+          &nbsp;&nbsp;<b>MUST_NOT:</b> [<br/>
+        &nbsp;&nbsp;&nbsp;&nbsp;{ PrefixQuery(product_code__BK-) }<br/>
+          &nbsp;&nbsp;]<br/>
+        }
+        "]
+        
+        H --> I["<b>C. Execute Filter against Inverted Index</b><br/>(produces a set of matching doc IDs)"]
     end
 
-    H -- "Matching doc IDs" --> Step2_Subgraph
-
-    subgraph Step2_Subgraph ["<b>Step 2: Sort Filtered Results</b>"]
-        I["<b>Execute Sort:</b><br/>Use Sort Instruction on filtered docs,<br/>accessing <b>date_field</b> columnar store for speed."]
-    end
-
-    Step2_Subgraph --> J["<B>Final Sorted Doc IDs</B>"]
+    I -- "Matching doc IDs" --> J["<B>Final Doc IDs</B>"]
 ```
 
 ### Understanding Analyzers
