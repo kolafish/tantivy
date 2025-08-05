@@ -208,23 +208,15 @@ graph TD
         E_Out --> G
         F_Out --> G
 
-        G --> H["
-        {<br/>
-          &nbsp;&nbsp;<b>MUST:</b> [<br/>
-        &nbsp;&nbsp;&nbsp;&nbsp;{ TermQuery for 'on_sale__true' },<br/>
-        &nbsp;&nbsp;&nbsp;&nbsp;{ BooleanQuery: {<br/>
-        &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<b>SHOULD:</b> [<br/>
-        &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;{ TermQuery for 'tags__outdoors' },<br/>
-        &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;{ TermQuery for 'tags__sports' }<br/>
-        &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;],<br/>
-        &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;minimum_should_match: 1<br/>
-        &nbsp;&nbsp;&nbsp;&nbsp;}}<br/>
-          &nbsp;&nbsp;],<br/>
-          &nbsp;&nbsp;<b>MUST_NOT:</b> [<br/>
-        &nbsp;&nbsp;&nbsp;&nbsp;{ PrefixQuery for 'product_code__BK-' }<br/>
-          &nbsp;&nbsp;]<br/>
-        }
-        "]
+        G --> H["{<br/>
+          &nbsp;&nbsp;<b>MUST:</b> [ { TermQuery for 'on_sale__true' },<br/>
+            &nbsp;&nbsp;&nbsp;&nbsp;{ BooleanQuery: {<br/>
+              &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<b>SHOULD:</b> [ {TermQuery 'tags__outdoors'}, {TermQuery 'tags__sports'} ],<br/>
+              &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;minimum_should_match: 1<br/>
+            &nbsp;&nbsp;&nbsp;&nbsp;} }<br/>
+          ],<br/>
+          &nbsp;&nbsp;<b>MUST_NOT:</b> [ { PrefixQuery for 'product_code__BK-' } ]<br/>
+        }"]
         
         H --> I["<b>C. Execute Filter against Inverted Index</b><br/>(produces a set of matching doc IDs)"]
     end
