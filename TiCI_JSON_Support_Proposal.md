@@ -192,9 +192,9 @@ When you run a query using `fts_*` functions, the TiDB optimizer recognizes them
 **Diagram B: The Query Pipeline (based on a complex query with mixed boolean logic)**
 ```mermaid
 graph TD
-    A["<b>User SQL Query (Complex Example)</b><br/>WHERE (fts_match_word(tags, 'outdoors') OR fts_match_word(tags, 'sports'))<br/>  AND fts_match_word(on_sale, 'true')<br/>  AND NOT fts_match_prefix(product_code, 'BK-')"]
+    A["<b>User SQL Query (Complex Example)</b><br/>WHERE (fts_match_word(tags, 'outdoors') OR fts_match_word(tags, 'sports'))<br/>  AND fts_match_word(on_sale, 'true')<br/>  AND NOT fts_match_prefix(product_code, 'BK-')<br/>ORDER BY release_date DESC"]
 
-    A --> Step1_Subgraph
+    A -- "WHERE clause" --> Step1_Subgraph
     A -- "ORDER BY clause" --> Step2_Subgraph
 
     subgraph Step1_Subgraph ["<b>Step 1: Translate WHERE clause and Filter</b>"]
@@ -231,7 +231,16 @@ graph TD
         H --> I["<b>C. Execute Filter against Inverted Index</b><br/>(produces a set of matching doc IDs)"]
     end
 
-    I -- "Matching doc IDs" --> J["<B>Final Doc IDs</B>"]
+    A -- "ORDER BY clause" --> Step2_Subgraph
+    I -- "Matching doc IDs" --> Step2_Subgraph
+
+    subgraph Step2_Subgraph ["<b>Step 2: Retrieve Sort Keys and Sort</b>"]
+        K["<b>D. Fetch values for sorting</b><br/>(from <b>Columnar Store</b> using doc IDs)"]
+        L["<b>E. Sort doc IDs</b><br/>(based on fetched values)"]
+        K --> L
+    end
+
+    L -- "Sorted doc IDs" --> J["<b>Final Doc IDs</b>"]
 ```
 
 ### Understanding Analyzers
