@@ -192,29 +192,28 @@ When you run a query using `fts_*` functions, the TiDB optimizer recognizes them
 **Diagram B: The Query Pipeline (based on Query Example #6)**
 ```mermaid
 graph TD
-    A["<b>User SQL Query (Example #6)</b><br/>...<br/>WHERE fts_match_word(data, '$.tags', 'outdoors')<br/>  AND ...<br/>ORDER BY data->>'$.release_date' DESC"]
+    A["<b>User SQL Query (Example #6)</b><br/>...<br/>WHERE ...<br/>ORDER BY data->>'$.release_date' DESC"]
 
-    A --> B{"TiCI Query Translator"};
+    A -- "WHERE clause" --> Step1_Subgraph
+    A -- "ORDER BY clause" --> Step2_Subgraph
 
-    subgraph "Translate Each Part of the Query"
-        direction LR
-        B -- "fts_match_word('$.tags', ...)" --> C{"TermQuery on <b>text_raw</b><br/>Term: 'tags__outdoors'"}
-        B -- "fts_match_word('$.on_sale', ...)" --> D{"TermQuery on <b>bytes_field</b><br/>Term: 'on_sale__true'"}
-        B -- "fts_match_prefix('$.product_code', ...)" --> E{"PrefixQuery on <b>text_raw</b><br/>Prefix: 'product_code__BK-'"}
-        B -- "fts_range('$.stock_level', ...)" --> F{"RangeQuery on <b>number_field</b><br/>Range: [5, 20]"}
-        B -- "ORDER BY ... '$.release_date' DESC" --> G_Sort{"<b>Sort Instruction</b><br/>Field: 'release_date'<br/>Direction: DESC"}
+    subgraph Step1_Subgraph ["<b>Step 1: Translate WHERE clause and Filter</b>"]
+        direction TB
+        B["<b>Translate & Combine:</b><br/>Each fts_* function in the WHERE clause is<br/>converted to a Tantivy query (e.g., TermQuery, RangeQuery).<br/>These are combined into a single BooleanQuery."]
+        C["<b>Execute Filter:</b><br/>The BooleanQuery is run against the Inverted Index.<br/>This produces a set of matching doc IDs."]
+        B --> C
     end
 
-    subgraph "Combine into a Single Plan"
-        C & D & E & F --> H{"<b>BooleanQuery</b><br/>(all with MUST clause)"}
+    C -- "Matching doc IDs" --> Step2_Subgraph
+
+    subgraph Step2_Subgraph ["<b>Step 2: Sort Filtered Results</b>"]
+        direction TB
+        D["<b>Translate Sort:</b><br/>The ORDER BY clause is converted<br/>to a Sort Instruction."]
+        E["<b>Execute Sort:</b><br/>For the filtered doc IDs, retrieve values<br/>from the appropriate columnar store and sort them."]
+        D --> E
     end
 
-    subgraph "Execute and Sort within TiCI"
-      H --> I{"<b>Step 1:</b> Inverted Index Search<br/>(Filter documents using BooleanQuery,<br/>produces a set of matching doc IDs)"}
-      I & G_Sort --> J{"<b>Step 2:</b> Sort Results<br/>(Retrieve values from <b>date_field</b> columnar store<br/>for the filtered doc IDs and sort them)"}
-    end
-
-    J --> K["<B>Final Sorted Doc IDs</B>"];
+    Step2_Subgraph --> F["<B>Final Sorted Doc IDs</B>"]
 ```
 
 ### Understanding Analyzers
