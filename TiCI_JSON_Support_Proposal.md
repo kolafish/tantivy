@@ -194,26 +194,31 @@ When you run a query using `fts_*` functions, the TiDB optimizer recognizes them
 graph TD
     A["<b>User SQL Query (Example #6)</b><br/>...<br/>WHERE ...<br/>ORDER BY data->>'$.release_date' DESC"]
 
-    A -- "WHERE clause" --> Step1_Subgraph
+    A --> Step1_Subgraph
     A -- "ORDER BY clause" --> Step2_Subgraph
 
     subgraph Step1_Subgraph ["<b>Step 1: Translate WHERE clause and Filter</b>"]
         direction TB
-        B["<b>Translate & Combine:</b><br/>Each fts_* function in the WHERE clause is<br/>converted to a Tantivy query (e.g., TermQuery, RangeQuery).<br/>These are combined into a single BooleanQuery."]
-        C["<b>Execute Filter:</b><br/>The BooleanQuery is run against the Inverted Index.<br/>This produces a set of matching doc IDs."]
-        B --> C
+
+        subgraph Translate_Subgraph ["A. Translate each condition to a Tantivy Query"]
+            direction LR
+            C["fts_match_word('$.tags', ...)<br/>(path is keyword)"] --> C_Out["TermQuery on <b>text_raw</b>"]
+            D["fts_match_prefix('$.product_code', ...)<br/>(path is keyword)"] --> D_Out["PrefixQuery on <b>text_raw</b>"]
+            E["fts_range('$.stock_level', ...)<br/>(path is numeric)"] --> E_Out["RangeQuery on <b>number_field</b>"]
+        end
+
+        Translate_Subgraph --> G["<b>B. Combine into a single BooleanQuery</b><br/>(all with MUST clause)"]
+        
+        G --> H["<b>C. Execute Filter against Inverted Index</b><br/>(produces a set of matching doc IDs)"]
     end
 
-    C -- "Matching doc IDs" --> Step2_Subgraph
+    H -- "Matching doc IDs" --> Step2_Subgraph
 
     subgraph Step2_Subgraph ["<b>Step 2: Sort Filtered Results</b>"]
-        direction TB
-        D["<b>Translate Sort:</b><br/>The ORDER BY clause is converted<br/>to a Sort Instruction."]
-        E["<b>Execute Sort:</b><br/>For the filtered doc IDs, retrieve values<br/>from the appropriate columnar store and sort them."]
-        D --> E
+        I["<b>Execute Sort:</b><br/>Use Sort Instruction on filtered docs,<br/>accessing <b>date_field</b> columnar store for speed."]
     end
 
-    Step2_Subgraph --> F["<B>Final Sorted Doc IDs</B>"]
+    Step2_Subgraph --> J["<B>Final Sorted Doc IDs</B>"]
 ```
 
 ### Understanding Analyzers
