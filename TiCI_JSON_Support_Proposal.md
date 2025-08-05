@@ -198,18 +198,16 @@ graph TD
     A -- "ORDER BY clause" --> Step2_Subgraph
 
     subgraph Step1_Subgraph ["<b>Step 1: Translate WHERE clause and Filter</b>"]
-        direction TB
+        C["Condition:<br/>tags = 'outdoors'"] --> C_Out["TermQuery on <b>text_raw</b><br/>Term: 'tags__outdoors'"]
+        D["Condition:<br/>tags = 'sports'"] --> D_Out["TermQuery on <b>text_raw</b><br/>Term: 'tags__sports'"]
+        E["Condition:<br/>on_sale = 'true'"] --> E_Out["TermQuery on <b>bytes_field</b><br/>Term: 'on_sale__true'"]
+        F["Condition:<br/>NOT product_code starts with 'BK-'"] --> F_Out["PrefixQuery on <b>text_raw</b><br/>Prefix: 'product_code__BK-'"]
 
-        subgraph Translate_Subgraph ["A. Translate each condition to a Tantivy Query"]
-            direction TD
-            C["Condition:<br/>tags = 'outdoors'"] --> C_Out["TermQuery on <b>text_raw</b><br/>Term: 'tags__outdoors'"]
-            D["Condition:<br/>tags = 'sports'"] --> D_Out["TermQuery on <b>text_raw</b><br/>Term: 'tags__sports'"]
-            E["Condition:<br/>on_sale = 'true'"] --> E_Out["TermQuery on <b>bytes_field</b><br/>Term: 'on_sale__true'"]
-            F["Condition:<br/>NOT product_code starts with 'BK-'"] --> F_Out["PrefixQuery on <b>text_raw</b><br/>Prefix: 'product_code__BK-'"]
-        end
+        C_Out --> G["<b>B. Combine into a nested BooleanQuery</b>"]
+        D_Out --> G
+        E_Out --> G
+        F_Out --> G
 
-        Translate_Subgraph --> G["<b>B. Combine into a nested BooleanQuery</b>"]
-        
         G --> H["
         {<br/>
           &nbsp;&nbsp;<b>MUST:</b> [<br/>
