@@ -93,11 +93,11 @@ CREATE TABLE products (
 ```
 
 ### Internal Implementation
-Internally, TiCI will pre-define a small, fixed number of dedicated, **native, single-valued** Tantivy fields for sorting (e.g., `sort_u64_1`, `sort_datetime_1`, `sort_f64_1`, `sort_bytes_1`, etc.). These fields are entirely separate from the multi-valued fields used for filtering.
+Based on the `sortable_fields` configuration, TiCI will dynamically add new fields directly to the Tantivy schema. Each key provided by the user in the configuration becomes a dedicated, **native, single-valued** Tantivy field.
 
-1.  **Static Mapping**: The `sortable_fields` configuration creates a static mapping between a user-defined name (e.g., `price`) and a dedicated internal Tantivy field (e.g., `sort_f64_1`).
-2.  **Native Indexing, No Prefixes**: During indexing, when the engine encounters a path that matches a configured sortable path (e.g., `$.price`), it extracts the value. It then writes this value *natively* to the corresponding dedicated fast field (`sort_f64_1`). **Crucially, no path-prefix encoding is used.** The raw value (or its term ordinal for `bytes`) is stored directly. This is done in addition to its normal indexing in the shared, multi-valued fields used for filtering.
-3.  **Efficient Sorting**: When a query like `ORDER BY data->>'$.price'` arrives, the planner recognizes that `price` is a pre-configured sort key. It then instructs the `TopDocs` collector to sort directly on the dedicated `sort_f64_1` fast field. Because this is a native, single-valued field, the operation is extremely fast, leveraging Tantivy's core sorting mechanism without any scanning or prefix matching.
+1.  **Dynamic Schema Modification**: For each entry in `sortable_fields`, like `"price": {"path": "$.price", "type": "f64"}`, TiCI adds a new field to the schema literally named `price`. This field is configured as a single-valued `f64` fast field. These fields are entirely separate from the shared, multi-valued fields used for general filtering.
+2.  **Native Indexing, No Prefixes**: During indexing, when the engine encounters a path that matches a configured sortable path (e.g., `$.price`), it extracts the value. It then writes this value *natively* to the corresponding dedicated fast field, which is now named `price`. **Crucially, no path-prefix encoding is used.** The raw value is stored directly. This is done in addition to its normal indexing in the shared, multi-valued fields.
+3.  **Efficient Sorting**: When a query like `ORDER BY data->>'$.price'` arrives, the planner recognizes that `price` is a pre-configured sort key. It then instructs the `TopDocs` collector to sort directly on the `price` fast field in the Tantivy index. Because this is a native, single-valued field, the operation is extremely fast, leveraging Tantivy's core sorting mechanism without any scanning or prefix matching.
 
 ### Benefits of This Approach
 -   **Maximum Performance**: Sorting operates on single-valued fast fields, restoring the constant-time access that makes sorting efficient. No scanning is required.
