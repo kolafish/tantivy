@@ -23,7 +23,7 @@ Fast fields in Tantivy are column-oriented storage structures optimized for effi
 Under the hood, fast fields store values in a compact, columnar format. For single-valued fields, this allows for constant-time retrieval of a value given a document ID. For multi-valued fields (like an array of tags), it stores a flattened list of all values along with a separate offset index to map document IDs to their corresponding range of values.
 
 ### How Fast Fields Enable Sorting
-Sorting requires efficiently accessing the values of the `ORDER BY` field for the documents that match the query's `WHERE` clause. Fast fields are essential for this. The `TopDocs` collector, which manages sorting, uses fast fields to retrieve these values directly without having to re-read and parse data from other parts of the index (like the inverted index or stored fields).
+Sorting requires efficiently accessing the values of the `ORDER BY` field for the documents that match the query. Fast fields are essential for this. The `TopDocs` collector, which manages sorting, uses fast fields to retrieve these values directly without having to re-read and parse data from other parts of the index (like the inverted index or stored fields).
 
 ### The Limitation: No Direct Sorting on `bytes` Fields
 A key challenge is that Tantivy's `TopDocs` collector does not natively support sorting on raw `bytes` fields. The collector is primarily designed to work with numeric types and specifically uses a `u64_collector` to read fast field data.
@@ -97,11 +97,11 @@ Based on the `sortable_fields` configuration, TiCI will dynamically add new fiel
 
 1.  **Dynamic Schema Modification**: For each entry in `sortable_fields`, like `"price": {"path": "$.price", "type": "f64"}`, TiCI adds a new field to the schema literally named `price`. This field is configured as a single-valued `f64` fast field. These fields are entirely separate from the shared, multi-valued fields used for general filtering.
 2.  **Native Indexing, No Prefixes**: During indexing, when the engine encounters a path that matches a configured sortable path (e.g., `$.price`), it extracts the value. It then writes this value *natively* to the corresponding dedicated fast field, which is now named `price`. **Crucially, no path-prefix encoding is used.** The raw value is stored directly. This is done in addition to its normal indexing in the shared, multi-valued fields.
-3.  **Efficient Sorting**: When a query like `ORDER BY data->>'$.price'` arrives, the planner recognizes that `price` is a pre-configured sort key. It then instructs the `TopDocs` collector to sort directly on the `price` fast field in the Tantivy index. Because this is a native, single-valued field, the operation is extremely fast, leveraging Tantivy's core sorting mechanism without any scanning or prefix matching.
+3.  **Efficient Sorting**: When a query like `ORDER BY data->>'$.price'` arrives, TiCI recognizes that `price` is a pre-configured sort key. It then instructs the `TopDocs` collector to sort directly on the `price` fast field in the Tantivy index. Because this is a native, single-valued field, the operation is extremely fast, leveraging Tantivy's core sorting mechanism without any scanning or prefix matching.
 
 ### Benefits of This Approach
 -   **Maximum Performance**: Sorting operates on single-valued fast fields, restoring the constant-time access that makes sorting efficient. No scanning is required.
 -   **Type Safety**: Explicitly defining the type (`f64`, `datetime`, `bytes`) allows for proper handling and encoding.
 -   **Clear Contract**: The user makes a conscious decision about which fields are important for sorting, which is a common requirement in search applications.
 
-The trade-off is a small loss in flexibility, as sortable fields must be defined upfront. However, this is a standard practice in high-performance search systems and provides a far superior user experience by guaranteeing fast and predictable `ORDER BY` performance. 
+The trade-off is a small loss in flexibility, as sortable fields must be defined upfront. 
