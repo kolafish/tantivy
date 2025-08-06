@@ -1,4 +1,4 @@
-# Design for High-Performance Sorting on Dynamic JSON Fields
+# Design for ORDER BY Implementation on Dynamic JSON Fields
 
 ## 1. Introduction
 
@@ -12,7 +12,7 @@ The proposed design is divided into four sections:
 3.  **The Performance Problem**: An analysis of why the naive approach is inefficient for our dynamic JSON use case.
 4.  **Recommended Solution**: A proposal for user-configured sort fields to achieve optimal performance.
 
-## 2. Part 1: Tantivy's Fast Fields and Sorting - The Current Landscape
+## 2. Tantivy's Fast Fields and Sorting: The Current Landscape
 
 ### What are Fast Fields?
 Fast fields in Tantivy are column-oriented storage structures optimized for efficient per-document value access. They are the core mechanism that enables features requiring rapid lookups of a field's value for a given document ID. Key use cases include:
@@ -26,48 +26,50 @@ Under the hood, fast fields store values in a compact, columnar format. For sing
 Sorting requires efficiently accessing the values of the `ORDER BY` field for the documents that match the query's `WHERE` clause. Fast fields are essential for this. The `TopDocs` collector, which manages sorting, uses fast fields to retrieve these values directly without having to re-read and parse data from other parts of the index (like the inverted index or stored fields).
 
 ### The Limitation: No Direct Sorting on `bytes` Fields
-A key challenge is that Tantivy's `TopDocs` collector does not natively support sorting on raw `bytes` fields. The collector is primarily designed to work with numeric types, and specifically uses a `u64_collector` to read fast field data.
+A key challenge is that Tantivy's `TopDocs` collector does not natively support sorting on raw `bytes` fields. The collector is primarily designed to work with numeric types and specifically uses a `u64_collector` to read fast field data.
 
 - **Supported Types**: `u64`, `i64`, `f64`, `datetime`, and `bool` fields can be directly sorted because their values have a natural numeric representation that fits the collector's architecture.
 - **Text Fields**: Sorting on `text` fields is supported through a clever workaround. Instead of sorting on the raw string values, Tantivy stores the **term ordinal** (a unique `u64` ID for each term in the field's dictionary) in the fast field. The collector can then sort these `u64` ordinals, which correctly reflects the lexicographical order of the original terms.
-- **Bytes Fields**: Although the schema allows a `bytes` field to be marked as `fast`, and the necessary reader/writer logic exists to store and retrieve the raw bytes, the `TopDocs` collector lacks a mechanism to sort on them directly.
+- **Bytes Fields**: Our JSON indexing strategy encodes numeric, date, and boolean values into a lexicographically comparable `bytes` format. These are then stored in a shared Tantivy `bytes` field, prefixed with their JSON path. Although the schema allows a `bytes` field to be marked as `fast`, and the necessary reader/writer logic exists, the `TopDocs` collector lacks a mechanism to sort on them directly.
 
-This presents a problem for our JSON indexing strategy, where we map all non-numeric types (strings, booleans, etc.) to a path-prefixed `bytes` field. To support `ORDER BY` on a JSON string field like `data->>'$.product_code'`, we must bridge this gap.
+This presents a problem. To support `ORDER BY` on a JSON field like `data->>'$.stock_level'`, which is stored as encoded bytes, we must bridge this gap.
 
-## 3. Part 2: A Naive Approach - Enabling `ORDER BY` on Bytes Fields
+## 3. A Naive Approach: Enabling `ORDER BY` on Bytes Fields
 
-To overcome the limitation described above, we can draw inspiration from how `text` fields are handled and implement a similar ordinal-based strategy for `bytes` fields.
+To overcome the limitation described above, we can draw inspiration from how `text` fields are handled and implement a similar ordinal-based strategy for our encoded `bytes` fields.
 
 ### The Proposal
-1.  **Dictionary Encoding for Bytes**: For any `bytes` field that needs to be sortable, we will build a dictionary of all its unique values during indexing. Each unique byte sequence (e.g., `'product_code__BK-R93R-44'`) is assigned a unique, monotonically increasing `u64` ordinal.
-2.  **Store Ordinals in Fast Field**: Instead of storing the raw bytes, we store these `u64` ordinals in the associated fast field. This dictionary-encoded data is compact and, critically, compatible with the `u64_collector` used by `TopDocs`.
-3.  **Enhance the Collector**: We would introduce a new function to the `TopDocs` collector, perhaps named `order_by_bytes_fast_field`. This function would work similarly to `order_by_string_fast_field`, instructing the collector to use the `u64` fast field containing the term ordinals for the specified `bytes` field.
+1.  **Leverage the Term Dictionary**: Our numeric and date values are already encoded into unique byte sequences that preserve their natural sort order. When indexed, these byte sequences are stored in the `bytes` field's term dictionary, and each unique sequence is assigned a term ID (`u64`). We can leverage this existing mechanism.
+2.  **Store Term IDs in Fast Field**: Instead of storing the raw bytes in the fast field, we store these `u64` term IDs. This dictionary-encoded data is compact and, critically, compatible with the `u64_collector` used by `TopDocs`.
+3.  **Enhance the Collector**: We would introduce a new function to the `TopDocs` collector, perhaps named `order_by_bytes_fast_field`. This function would work similarly to `order_by_string_fast_field`, instructing the collector to use the `u64` fast field containing the term IDs for the specified `bytes` field.
 
 With this change, the `bytes` field becomes sortable, seemingly solving our problem. However, this approach introduces a significant performance issue when applied to the dynamic nature of our JSON indexing schema.
 
-## 4. Part 3: The Performance Problem - The Inefficiency of Multi-Valued Fields
+## 4. The Performance Problem: Inefficiency with Multi-Valued Fields
 
-Our core JSON indexing strategy involves mapping a potentially unlimited number of JSON paths to a small, fixed number of underlying Tantivy fields (e.g., `text_raw`, `number_field`). For any given document, a field like `text_raw` acts as a **multi-valued field**, holding all string-like values from the source JSON.
+Our core JSON indexing strategy involves mapping a potentially unlimited number of JSON paths to a small, fixed number of underlying Tantivy fields. For any given document, a field like our `bytes` field acts as a **multi-valued field**, holding all the encoded numeric/date/bool values from the source JSON.
 
 For example, the JSON document:
 ```json
-{ "product_code": "A", "color": "blue", "on_sale": true }
+{ "stock_level": 8, "orders_count": 120, "rating": 5 }
 ```
-would result in multiple path-prefixed entries in the `bytes` field for a single document ID: `'product_code__A'`, `'color__blue'`, `'on_sale__true'`.
+would result in multiple path-prefixed entries in the shared `bytes` field for a single document ID: `'stock_level__' + encoded(8)`, `'orders_count__' + encoded(120)`, `'rating__' + encoded(5)`.
 
 ### The Sorting Bottleneck
-When a user executes `ORDER BY data->>'$.product_code'`, the naive implementation runs into a major bottleneck. Tantivy's fast field access is optimized for retrieving *all* values for a given document, not for picking a *specific* value from a multi-valued set based on a prefix.
+When a user executes `ORDER BY data->>'$.stock_level'`, the naive implementation runs into a major bottleneck. Tantivy's fast field access is optimized for retrieving *all* values for a given document, not for picking a *specific* value from a multi-valued set based on a prefix.
 
 To find the sort key for a single document, the process would be:
-1.  Use the document ID to find the slice of `u64` ordinals belonging to it in the fast field.
-2.  Iterate through every ordinal in that slice.
-3.  For each ordinal, perform a reverse lookup in the `bytes` dictionary to get the original byte value (e.g., `'color__blue'`).
-4.  Check if this value starts with the desired path prefix (e.g., `'product_code__'`).
+1.  Use the document ID to find the slice of `u64` term IDs belonging to it in the fast field.
+2.  Iterate through every term ID in that slice.
+3.  For each term ID, perform a reverse lookup in the `bytes` term dictionary to get the original byte value (e.g., `'orders_count__' + encoded(120)`).
+4.  Check if this value starts with the desired path prefix (e.g., `'stock_level__'`).
 5.  If it matches, we have found the sort key. If not, continue iterating.
 
 This linear scan must be performed for every document in the result set. For JSON objects with hundreds of keys, this process is prohibitively slow and negates the "fast" in "fast fields." The efficiency of constant-time access is lost to a slow, repeated search *within* each document's data.
 
-## 5. Part 4: The Recommended Solution - Explicitly Configured Sort Fields
+One theoretical solution would be to fundamentally modify Tantivy's columnar storage. We could make the fast field writer and readers "path-aware." During indexing, the writer would decode the path prefix (e.g., `'stock_level__'`) and route the value to a separate internal column dedicated to that path. This would solve the scan-on-read problem but represents a major, hacky modification to the core of Tantivy and is not a sustainable path.
+
+## 5. An Alternative Approach: Explicitly Configured Sort Fields
 
 To achieve true high-performance sorting, we must avoid the multi-value scanning problem. The most robust way to do this is to require users to declare which JSON paths they intend to use for sorting at index creation time.
 
