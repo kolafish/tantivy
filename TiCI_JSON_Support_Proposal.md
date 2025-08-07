@@ -239,16 +239,20 @@ graph TD
     A["Input Text:<br/>'Awesome Steel Bike'"]
 
     subgraph "Keyword Analyzer (Exact Match)"
-        A --> B["One Token:<br/>'Awesome Steel Bike'"]
+        B["One Token:<br/>'Awesome Steel Bike'"]
     end
 
     subgraph "Standard Analyzer (Full-Text Search)"
-        A --> C["Tokens:<br/>'awesome', 'steel', 'bike'"]
+        C["Tokens:<br/>'awesome', 'steel', 'bike'"]
     end
 
     subgraph "Edge N-gram Analyzer (Prefix Search)"
-        A --> D["Tokens:<br/>'a', 'aw', 'awe', 'awes', ...<br/>'s', 'st', 'ste', 'stee', ...<br/>'b', 'bi', 'bik', 'bike'"]
+        D["Tokens:<br/>'a', 'aw', 'awe', 'awes', ...<br/>'s', 'st', 'ste', 'stee', ...<br/>'b', 'bi', 'bik', 'bike'"]
     end
+
+    A --> B
+    A --> C
+    A --> D
 ```
 
 ### Indexing for Performance: Beyond Text
