@@ -120,7 +120,9 @@ ORDER BY data->>'$.release_date' DESC;
 
 ### The Indexing Pipeline
 
-TiCI processes JSON by flattening it into path-value pairs. Based on your configuration, it applies specific analyzers to each path, converting values into indexed terms for fast retrieval. This indexing process is the key to accelerating queries on all data types.
+TiCI processes JSON by flattening it into path-value pairs. For paths explicitly defined in your `path_configs`, TiCI applies the specified analyzer. For all other paths, it uses a default analyzer based on the value's data type (e.g., standard tokenizer for text, keyword for identifiers).
+
+To distinguish between different keys that map to the same internal field (e.g., all numbers map to a single `number_field`), TiCI automatically **encodes the JSON path as a prefix to the indexed value**. This is the key mechanism that allows filtering on any arbitrary path.
 
 For the diagrams below, we will use a simplified JSON document to illustrate the core concepts clearly.
 
@@ -129,7 +131,8 @@ For the diagrams below, we will use a simplified JSON document to illustrate the
 {
   "title": "Awesome Steel Bike",
   "product_code": "BK-R93R-44",
-  "stock_level": 8
+  "stock_level": 8,
+  "price": 99.99
 }
 ```
 
@@ -137,7 +140,7 @@ For the diagrams below, we will use a simplified JSON document to illustrate the
 ```mermaid
 graph TD
     subgraph "Input: Simplified JSON Document"
-        A["{<br/>'title': 'Awesome Steel Bike',<br/>'product_code': 'BK-R93R-44',<br/>'stock_level': 8<br/>}"]
+        A["{<br/>'title': 'Awesome Steel Bike',<br/>'product_code': 'BK-R93R-44',<br/>'stock_level': 8,<br/>'price': 99.99<br/>}"]
     end
 
     A --> B{"Flatten to<br/>Path-Value Pairs"};
@@ -146,31 +149,31 @@ graph TD
         C["'$.title': 'Awesome Steel Bike'"]
         D["'$.product_code': 'BK-R93R-44'"]
         E["'$.stock_level': 8"]
+        F["'$.price': 99.99"]
     end
-    B --> C & D & E
+    B --> C & D & E & F
 
     C --> H{"Automatic Mapping Logic<br/>(based on value type and path config)"};
     D --> H;
     E --> H;
+    F --> H;
 
     subgraph "Fixed Internal Fields"
-        subgraph "Text Fields"
-            I["<b>text_analyzed</b><br>(Standard Tokenizer)"]
-            J["<b>text_raw</b><br>(Keyword/Identifier)"]
-        end
-        subgraph "Typed Fields (Bytes)"
-            L["<b>number_field</b>"]
-        end
+        I["<b>text_analyzed</b><br>(Standard Tokenizer)"]
+        J["<b>text_raw</b><br>(Keyword/Identifier)"]
+        L["<b>number_field</b><br>(Shared for all numeric types)"]
     end
     
     H -- "'$.title' -> Analyzed" --> I
     H -- "'$.product_code' -> Raw" --> J
     H -- "'$.stock_level' -> Numeric" --> L
+    H -- "'$.price' -> Numeric" --> L
 
-    subgraph "Indexed Terms (Path-Prefixed)"
-        I ==> P["'title__awesome',<br/>'title__steel', 'title__bike'"]
+    subgraph "Indexed Terms (Path Prefixed)"
+        I ==> P["'title__awesome', 'title__steel', ..."]
         J ==> Q["'product_code__BK-R93R-44'"]
         L ==> R["'stock_level__' + encoded(8)"]
+        L ==> S["'price__' + encoded(99.99)"]
     end
 ```
 
