@@ -17,7 +17,6 @@ To provide a clear and powerful interface that feels native to the TiDB/MySQL ec
 ### Proposed Functions:
 
 *   `fts_match_word(json_col, path, query_text)`: The primary function for single-term matching.
-*   `fts_match_prefix(json_col, path, prefix_text)`: For dedicated prefix matching.
 *   `fts_range(json_col, path)`: A marker for accelerating range queries on numeric and date fields. It is used in conjunction with standard SQL operators (`>`, `<`, `BETWEEN`).
 *   `fts_exists(json_col, path)`: A boolean function to check if a given JSON path exists and is not `null`.
 
@@ -25,21 +24,22 @@ To provide a clear and powerful interface that feels native to the TiDB/MySQL ec
 
 ### 🔨 Table and Index Definition
 
-First, define a `FULLTEXT` index on your `JSON` column. The `PARAMETER` clause is used to pass TiCI-specific configuration, such as custom analyzers for different JSON paths.
+First, create your table, and then add a `FULLTEXT` index on the `JSON` column. The `PARAMETER` clause is used to pass TiCI-specific configuration, such as custom analyzers for different JSON paths.
 
 ```sql
 CREATE TABLE products (
   id BIGINT PRIMARY KEY,
-  data JSON,
-  FULLTEXT INDEX idx_product_data (data) PARAMETER 'tici:{
-    "default_analyzer": "standard",
-    "path_configs": [
-      {"path": "$.product_code", "analyzer": "keyword"},
-      {"path": "$.title", "analyzer": "english_stemmer"},
-      {"path": "$.phone_numbers[*]", "analyzer": "edge_ngram_3_10"}
-    ]
-  }'
+  data JSON
 );
+
+ALTER TABLE products ADD FULLTEXT INDEX idx_product_data (data) PARAMETER 'tici:{
+  "default_analyzer": "standard",
+  "path_configs": [
+    {"path": "$.product_code", "analyzer": "keyword"},
+    {"path": "$.title", "analyzer": "english_stemmer"},
+    {"path": "$.phone_numbers[*]", "analyzer": "edge_ngram_3_10"}
+  ]
+}';
 ```
 
 ### 🔍 Example JSON Document
@@ -90,7 +90,7 @@ WHERE fts_match_word(data, '$.tags', 'sports')
   AND NOT fts_match_word(data, '$.tags', 'outdoors');
 ```
 
-#### 4. Checking for NULL values
+#### 4. Checking for Field Existence
 
 Find products where the `product_code` field exists and is not null.
 
@@ -99,18 +99,9 @@ SELECT * FROM products
 WHERE fts_exists(data, '$.product_code');
 ```
 
-#### 5. Prefix Search on an Array of Strings
+#### 5. Complex Combined Query
 
-Find a product by the prefix of a phone number.
-
-```sql
-SELECT * FROM products
-WHERE fts_match_prefix(data, '$.phone_numbers', '138123');
-```
-
-#### 6. Complex Combined Query
-
-Find outdoor products that are on sale, have a stock level between 5 and 20, and have a product code that starts with "BK-". Order the results by most recently released.
+Find outdoor products that are on sale, have a stock level between 5 and 20, and have a `product_code` of "BK-R93R-44". Order the results by most recently released.
 
 ```sql
 SELECT id, data->>'$.title', data->>'$.stock_level'
@@ -118,7 +109,7 @@ FROM products
 WHERE
   fts_match_word(data, '$.tags', 'outdoors')
   AND fts_match_word(data, '$.on_sale', 'true')
-  AND fts_match_prefix(data, '$.product_code', 'BK-')
+  AND fts_match_word(data, '$.product_code', 'BK-R93R-44')
   AND fts_range(data, '$.stock_level') BETWEEN 5 AND 20
 ORDER BY data->>'$.release_date' DESC;
 ```
@@ -250,9 +241,7 @@ While filtering on JSON fields is straightforward, sorting (`ORDER BY`) introduc
 
 **The Challenge: Dynamic vs. Static Fields**
 
-At its core, TiCI's inverted index is designed for incredibly fast filtering. It can quickly find all documents that contain a specific value (e.g., `product_code = 'BK-R93R-44'`). However, sorting requires a different access pattern. To sort results, the system needs to look up the value of the `ORDER BY` field for *every document* that matches the `WHERE` clause.
-
-When sorting by a top-level TiDB column (e.g., `ORDER BY id`), this is extremely fast. But with JSON, the field being sorted on (`data->>'$.stock_level'`) is just one of potentially hundreds of different keys within a single JSON object. To provide maximum flexibility, TiCI maps all JSON paths of the same data type (like numbers) into a single, shared internal field. This means that to find the `stock_level` value for sorting, the system must scan through all numeric values in the document (e.g., `price`, `rating`, `stock_level`) to find the right one. This scan-and-check process for every matched row can significantly slow down queries on large datasets.
+To provide flexibility, TiCI maps all JSON paths of the same data type (e.g., all numbers, all strings) into a single, shared internal field. This is highly efficient for filtering. However, when sorting on a specific JSON field (e.g., `ORDER BY data->>'$.stock_level'`), the system must scan through all the numeric values within each document to find the correct one for `stock_level`. This scan-and-check process for every matched row can slow down queries on large datasets.
 
 **The Solutions: Explicit Configuration for Optimal Performance**
 
@@ -288,8 +277,7 @@ ALTER TABLE products ADD COLUMN stock_level_generated BIGINT
   AS (data->>'$.stock_level') STORED;
 
 -- The generated column MUST be included in the FTS index
-CREATE FULLTEXT INDEX idx_product_data_with_sort
-  ON products(data, stock_level_generated);
+ALTER TABLE products ADD FULLTEXT INDEX idx_product_data_with_sort (data, stock_level_generated);
 ```
 
 **How it Works:**
