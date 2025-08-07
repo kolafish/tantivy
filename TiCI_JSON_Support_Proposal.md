@@ -155,8 +155,7 @@ graph TD
     F --> H;
     G_Date --> H;
 
-    subgraph "Tantivy Index with Fixed Internal Fields"
-        direction TB
+    subgraph "Tantivy Index with<br/>Fixed Internal Fields"
         subgraph "Text Fields"
             I["<b>text_analyzed</b><br>(Standard Tokenizer)"]
             J["<b>text_raw</b><br>(Keyword/Identifier)"]
@@ -217,7 +216,6 @@ graph TD
         H --> I["<b>C. Execute Filter against Inverted Index</b><br/>(produces a set of matching doc IDs)"]
     end
 
-    A -- "ORDER BY clause" --> Step2_Subgraph
     I -- "Matching doc IDs" --> Step2_Subgraph
 
     subgraph Step2_Subgraph ["<b>Step 2: Retrieve Sort Keys and Sort</b>"]
@@ -231,7 +229,7 @@ graph TD
 
 ### Understanding Analyzers
 
-The choice of analyzer is critical for defining *how* a field can be searched.
+The choice of analyzer is critical for defining *how* a field can be searched. For example, if you want to perform prefix matching on phone numbers, you should choose the `edge_ngram` tokenizer and use `fts_match_word` when querying.
 
 **Diagram C: Analyzer Comparison for "Awesome Steel Bike"**
 ```mermaid
