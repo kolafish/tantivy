@@ -35,8 +35,7 @@ CREATE TABLE products (
     "default_analyzer": "standard",
     "path_configs": [
       {"path": "$.product_code", "analyzer": "keyword"},
-      {"path": "$.title", "analyzer": "english_stemmer"},
-      {"path": "$.phone_numbers[*]", "analyzer": "edge_ngram_3_10"}
+      {"path": "$.title", "analyzer": "english_stemmer"}
     ]
   }'
 );
@@ -48,79 +47,41 @@ CREATE TABLE products (
 {
   "title": "Awesome Steel Bike",
   "product_code": "BK-R93R-44",
-  "stock_level": 8,
-  "on_sale": true,
-  "tags": ["bicycle", "sports", "outdoors"],
-  "phone_numbers": ["13812345678", "15987654321"],
-  "release_date": "2023-05-01T10:00:00Z"
+  "stock_level": 8
 }
 ```
 
 ### 🔍 Query Examples
 
-#### 1. Text Search with Sorting and Pagination
+#### 1. Text Search with Sorting and Filtering
 
-Find products matching "bike", order by release date, and return the top 10. The `ORDER BY` on `release_date` is accelerated by TiCI.
+Find products matching "bike" with a stock level greater than 5, and order by stock level.
+The `WHERE` and `ORDER BY` clauses are both accelerated by TiCI.
 
 ```sql
-SELECT id, data->>'$.title'
+SELECT id, data->>'$.title', data->>'$.stock_level'
 FROM products
 WHERE fts_match_word(data, '$.title', 'bike')
-ORDER BY data->>'$.release_date' DESC
-LIMIT 10;
+  AND fts_range(data, '$.stock_level') > 5
+ORDER BY data->>'$.stock_level' DESC;
 ```
 
-#### 2. Combined Exact Match and Range Filter
+#### 2. Exact Match
 
-Find bikes in stock that are not on sale. Both conditions are pushed down to TiCI.
+Find products with a specific product code.
 
 ```sql
 SELECT * FROM products
-WHERE fts_match_word(data, '$.on_sale', 'false')
-  AND fts_range(data, '$.stock_level') > 0;
+WHERE fts_match_word(data, '$.product_code', 'BK-R93R-44');
 ```
 
-#### 3. Searching within an Array (`NOT IN` equivalent)
-
-Find products tagged "sports" but not "outdoors".
-
-```sql
-SELECT * FROM products
-WHERE fts_match_word(data, '$.tags', 'sports')
-  AND NOT fts_match_word(data, '$.tags', 'outdoors');
-```
-
-#### 4. Checking for NULL values
+#### 3. Checking for Field Existence
 
 Find products where the `product_code` field exists and is not null.
 
 ```sql
 SELECT * FROM products
 WHERE fts_exists(data, '$.product_code');
-```
-
-#### 5. Prefix Search on an Array of Strings
-
-Find a product by the prefix of a phone number.
-
-```sql
-SELECT * FROM products
-WHERE fts_match_prefix(data, '$.phone_numbers', '138123');
-```
-
-#### 6. Complex Combined Query
-
-Find outdoor products that are on sale, have a stock level between 5 and 20, and have a product code that starts with "BK-". Order the results by most recently released.
-
-```sql
-SELECT id, data->>'$.title', data->>'$.stock_level'
-FROM products
-WHERE
-  fts_match_word(data, '$.tags', 'outdoors')
-  AND fts_match_word(data, '$.on_sale', 'true')
-  AND fts_match_prefix(data, '$.product_code', 'BK-')
-  AND fts_range(data, '$.stock_level') BETWEEN 5 AND 20
-ORDER BY data->>'$.release_date' DESC;
 ```
 
 ---
@@ -135,7 +96,7 @@ TiCI processes JSON by flattening it into path-value pairs. Based on your config
 ```mermaid
 graph TD
     subgraph "Input: Example JSON Document"
-        A["{<br/>'title': 'Awesome Steel Bike',<br/>'product_code': 'BK-R93R-44',<br/>'stock_level': 8,<br/>'phone_numbers': ['138...'],<br/>'release_date': '2023-05-01...',<br/>...<br/>}"]
+        A["{<br/>'title': 'Awesome Steel Bike',<br/>'product_code': 'BK-R93R-44',<br/>'stock_level': 8<br/>}"]
     end
 
     A --> B{"Flatten to<br/>Path-Value Pairs"};
@@ -144,43 +105,31 @@ graph TD
         C["'$.title': 'Awesome Steel Bike'"]
         D["'$.product_code': 'BK-R93R-44'"]
         E["'$.stock_level': 8"]
-        F["'$.phone_numbers[0]':<br/>'13812345678'"]
-        G_Date["'$.release_date':<br/>'2023-05-01...'"]
     end
-    B --> C & D & E & F & G_Date
+    B --> C & D & E
 
     C --> H{"Automatic Mapping Logic<br/>(based on value type and path config)"};
     D --> H;
     E --> H;
-    F --> H;
-    G_Date --> H;
 
-    subgraph "Tantivy Index with<br/>Fixed Internal Fields"
+    subgraph "Fixed Internal Fields"
         subgraph "Text Fields"
             I["<b>text_analyzed</b><br>(Standard Tokenizer)"]
             J["<b>text_raw</b><br>(Keyword/Identifier)"]
-            K["<b>text_ngram</b><br>(Edge N-Gram Tokenizer)"]
         end
         subgraph "Typed Fields (Bytes)"
             L["<b>number_field</b>"]
-            M["<b>date_field</b>"]
         end
     end
     
     H -- "'$.title' -> Analyzed" --> I
     H -- "'$.product_code' -> Raw" --> J
     H -- "'$.stock_level' -> Numeric" --> L
-    H -- "'$.release_date' -> Date" --> M
-    H -- "'$.phone_numbers' -> N-Gram" --> K
-    H -- "'$.phone_numbers' -> Raw (also)" --> J
 
     subgraph "Indexed Terms (Path-Prefixed)"
-        I ==> P["'title__awesom',<br/>'title__steel', ..."]
+        I ==> P["'title__awesome',<br/>'title__steel', 'title__bike'"]
         J ==> Q["'product_code__BK-R93R-44'"]
         L ==> R["'stock_level__' + encoded(8)"]
-        M ==> S["'release_date__' + encoded(...)"]
-        K ==> T["'phone_numbers__138',<br/>'phone_numbers__1381', ..."]
-        J ==> U["'phone_numbers__13812345678'"]
     end
 ```
 
@@ -188,30 +137,22 @@ graph TD
 
 When you run a query using `fts_*` functions, the TiDB optimizer recognizes them and rewrites the plan to delegate the filtering work to TiCI. **Crucially, this includes range filters and sorting**, which are executed efficiently on the TiCI index, not on the TiDB level.
 
-**Diagram B: The Query Pipeline (based on a complex query with mixed boolean logic)**
+**Diagram B: The Query Pipeline**
 ```mermaid
 graph TD
-    A["<b>User SQL Query (Complex Example)</b><br/>WHERE (fts_match_word(tags, 'outdoors') OR fts_match_word(tags, 'sports'))<br/>  AND fts_match_word(on_sale, 'true')<br/>  AND NOT fts_match_prefix(product_code, 'BK-')<br/>ORDER BY release_date DESC"]
+    A["<b>User SQL Query</b><br/>WHERE fts_match_word(data, '$.title', 'bike')<br/>  AND fts_range(data, '$.stock_level') > 5<br/>ORDER BY data->>'$.stock_level' DESC"]
 
     A -- "WHERE clause" --> Step1_Subgraph
     A -- "ORDER BY clause" --> Step2_Subgraph
 
     subgraph Step1_Subgraph ["<b>Step 1: Translate WHERE clause and Filter</b>"]
-        C["Condition:<br/>tags = 'outdoors'"] --> C_Out["TermQuery on <b>text_raw</b><br/>Term: 'tags__outdoors'"]
-        D["Condition:<br/>tags = 'sports'"] --> D_Out["TermQuery on <b>text_raw</b><br/>Term: 'tags__sports'"]
-        E["Condition:<br/>on_sale = 'true'"] --> E_Out["TermQuery on <b>bytes_field</b><br/>Term: 'on_sale__true'"]
-        F["Condition:<br/>NOT product_code starts with 'BK-'"] --> F_Out["PrefixQuery on <b>text_raw</b><br/>Prefix: 'product_code__BK-'"]
-
-        C_Out --> G["<b>B. Combine into a nested BooleanQuery</b>"]
+        C["Condition:<br/>title = 'bike'"] --> C_Out["TermQuery on <b>text_analyzed</b><br/>Term: 'title__bike'"]
+        D["Condition:<br/>stock_level > 5"] --> D_Out["RangeQuery on <b>number_field</b><br/>Range: ('stock_level__' + encoded(5), infinity)"]
+        
+        C_Out --> G["<b>B. Combine into a BooleanQuery</b>"]
         D_Out --> G
-        E_Out --> G
-        F_Out --> G
 
-        G --> H["{<br/>
-          &nbsp;&nbsp;<b>MUST:</b> [ { TermQuery for 'on_sale__true' },<br/>
-            &nbsp;&nbsp;&nbsp;&nbsp;{ BooleanQuery: { <b>SHOULD:</b> ['tags__outdoors', 'tags__sports'], min_should_match: 1 } } ],<br/>
-          &nbsp;&nbsp;<b>MUST_NOT:</b> [ { PrefixQuery for 'product_code__BK-' } ]<br/>
-        }"]
+        G --> H["{<br/>&nbsp;&nbsp;<b>MUST:</b> [ <br/>&nbsp;&nbsp;&nbsp;&nbsp;{ TermQuery for 'title__bike' },<br/>&nbsp;&nbsp;&nbsp;&nbsp;{ RangeQuery on 'stock_level' }<br/>&nbsp;&nbsp;]<br/>}"]
         
         H --> I["<b>C. Execute Filter against Inverted Index</b><br/>(produces a set of matching doc IDs)"]
     end
@@ -219,7 +160,7 @@ graph TD
     I -- "Matching doc IDs" --> Step2_Subgraph
 
     subgraph Step2_Subgraph ["<b>Step 2: Retrieve Sort Keys and Sort</b>"]
-        K["<b>D. Fetch values for sorting</b><br/>(from <b>Columnar Store</b> using doc IDs)"]
+        K["<b>D. Fetch 'stock_level' values for sorting</b><br/>(from <b>Columnar Store</b> using doc IDs)"]
         L["<b>E. Sort doc IDs</b><br/>(based on fetched values)"]
         K --> L
     end
@@ -253,17 +194,66 @@ graph TD
     A --> D
 ```
 
-### Indexing for Performance: Beyond Text
+### High-Performance Sorting on JSON: A Technical Deep-Dive
 
-For numeric, date, and boolean fields, TiCI employs a sophisticated two-part strategy to deliver high performance for both filtering and sorting.
+While filtering on JSON fields is straightforward, sorting (`ORDER BY`) introduces a unique performance challenge that requires a specific solution.
 
-1.  **Inverted Index for Fast Filtering**: All values, including numbers and dates, are first converted into a comparable byte-encoded format and placed into TiCI's inverted index. This allows the full power of the inverted index to be used for these types.
-    *   **Exact Matches** (e.g., `stock_level = 8`) become fast term lookups.
-    *   **Range Scans** (e.g., `stock_level > 5`) become efficient range lookups on the terms in the inverted index.
+**The Challenge: Dynamic vs. Static Fields**
 
-2.  **Columnar Store for Fast Sorting**: When a query requires sorting (`ORDER BY`) on a numeric or date field, retrieving values one by one from the inverted index would be inefficient. To solve this, TiCI maintains a separate, auxiliary **columnar store** for these fields. This is a simple data structure that stores the values sequentially and can be accessed directly by a document's internal ID. After the inverted index has rapidly filtered the documents down to a small result set, this columnar store provides a high-speed path to retrieve the values needed for the final sort.
+At its core, TiCI's inverted index is designed for incredibly fast filtering. It can quickly find all documents that contain a specific value (e.g., `product_code = 'BK-R93R-44'`). However, sorting requires a different access pattern. To sort results, the system needs to look up the value of the `ORDER BY` field for *every document* that matches the `WHERE` clause.
 
-This dual approach ensures that both filtering and sorting operations are executed with maximum efficiency.
+When sorting by a top-level TiDB column (e.g., `ORDER BY id`), this is extremely fast. But with JSON, the field being sorted on (`data->>'$.stock_level'`) is just one of potentially hundreds of different keys within a single JSON object.
+
+Because all these different JSON paths and values are indexed together, finding the specific value for `stock_level` for a given document requires an inefficient scan-and-check process for each row in the result set. This can significantly slow down queries on large datasets.
+
+**The Solutions: Explicit Configuration for Optimal Performance**
+
+To guarantee the high-speed sorting that users expect, we provide two robust solutions. Both approaches work by moving the sort key out of the dynamic JSON structure and into a dedicated, optimized field.
+
+**1. Recommended: Explicitly Configure Sortable Fields in TiCI**
+
+The most powerful and recommended approach is to tell TiCI which JSON fields you intend to sort by. You can do this with a `sortable_fields` configuration in the `COMMENT` of your index definition.
+
+```sql
+CREATE TABLE products (
+  id BIGINT PRIMARY KEY,
+  data JSON,
+  FULLTEXT INDEX idx_product_data (data) COMMENT 'tici:{
+    ... -- other configs
+    "sortable_fields": {
+      "stock": {"path": "$.stock_level", "type": "f64"},
+      "release_date": {"path": "$.release_date", "type": "datetime"}
+    }
+  }'
+);
+```
+
+**How it Works:**
+When you declare a field as "sortable," TiCI creates a dedicated, high-performance columnar storage for just that field behind the scenes. When you run a query with `ORDER BY data->>'$.stock_level'`, TiCI automatically uses this optimized storage, resulting in extremely fast sorting performance that is on par with sorting on a native TiDB column.
+
+**2. Alternative: Use Generated Columns in TiDB**
+
+If you prefer to manage schema at the TiDB level, you can use a standard `GENERATED ALWAYS AS` column to extract the sortable field from the JSON.
+
+```sql
+ALTER TABLE products ADD COLUMN stock_level_generated BIGINT
+  AS (data->>'$.stock_level') STORED;
+
+-- Create a standard TiDB index for sorting
+CREATE INDEX idx_stock_level on products(stock_level_generated);
+```
+
+**How it Works:**
+With this approach, you simply use the generated column in your `ORDER BY` clause. TiDB will use its standard B-Tree index to provide efficient sorting.
+
+```sql
+SELECT id, data->>'$.title'
+FROM products
+WHERE fts_match_word(data, '$.title', 'bike')
+ORDER BY stock_level_generated DESC;
+```
+
+By requiring this explicit configuration, we ensure that every `ORDER BY` operation on a JSON field is a high-performance operation, avoiding unexpected slowdowns and providing a predictable, scalable solution.
 
 ## 5. Design Considerations (Current Limitations)
 
