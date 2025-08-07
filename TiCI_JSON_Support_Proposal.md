@@ -132,7 +132,7 @@ For the diagrams below, we will use a simplified JSON document to illustrate the
   "title": "Awesome Steel Bike",
   "product_code": "BK-R93R-44",
   "stock_level": 8,
-  "price": 99.99
+  "review_count": 150
 }
 ```
 
@@ -140,7 +140,7 @@ For the diagrams below, we will use a simplified JSON document to illustrate the
 ```mermaid
 graph TD
     subgraph "Input: Simplified JSON Document"
-        A["{<br/>'title': 'Awesome Steel Bike',<br/>'product_code': 'BK-R93R-44',<br/>'stock_level': 8,<br/>'price': 99.99<br/>}"]
+        A["{<br/>'title': 'Awesome Steel Bike',<br/>'product_code': 'BK-R93R-44',<br/>'stock_level': 8,<br/>'review_count': 150<br/>}"]
     end
 
     A --> B{"Flatten to<br/>Path-Value Pairs"};
@@ -149,7 +149,7 @@ graph TD
         C["'$.title': 'Awesome Steel Bike'"]
         D["'$.product_code': 'BK-R93R-44'"]
         E["'$.stock_level': 8"]
-        F["'$.price': 99.99"]
+        F["'$.review_count': 150"]
     end
     B --> C & D & E & F
 
@@ -167,13 +167,13 @@ graph TD
     H -- "'$.title' -> Analyzed" --> I
     H -- "'$.product_code' -> Raw" --> J
     H -- "'$.stock_level' -> Numeric" --> L
-    H -- "'$.price' -> Numeric" --> L
+    H -- "'$.review_count' -> Numeric" --> L
 
     subgraph "Indexed Terms (Path Prefixed)"
         I ==> P["'title__awesome', 'title__steel', ..."]
         J ==> Q["'product_code__BK-R93R-44'"]
         L ==> R["'stock_level__' + encoded(8)"]
-        L ==> S["'price__' + encoded(99.99)"]
+        L ==> S["'review_count__' + encoded(150)"]
     end
 ```
 
@@ -184,32 +184,32 @@ When you run a query using `fts_*` functions, the TiDB optimizer recognizes them
 **Diagram B: The Query Pipeline**
 ```mermaid
 graph TD
-    A["<b>User SQL Query</b><br/>WHERE fts_match_word(data, '$.title', 'bike')<br/>  AND fts_range(data, '$.stock_level') > 5<br/>ORDER BY data->>'$.stock_level' DESC"]
+    A_Query["<b>User SQL Query</b><br/>WHERE fts_match_word(data, '$.title', 'bike')<br/>  AND fts_range(data, '$.stock_level') > 5<br/>ORDER BY data->>'$.stock_level' DESC"]
 
-    A -- "WHERE clause" --> Step1_Subgraph
-    A -- "ORDER BY clause" --> Step2_Subgraph
+    A_Query -- "WHERE clause" --> Step1_Subgraph
+    A_Query -- "ORDER BY clause" --> Step2_Subgraph
 
     subgraph Step1_Subgraph ["<b>Step 1: Translate WHERE clause and Filter</b>"]
-        C["Condition:<br/>title = 'bike'"] --> C_Out["TermQuery on <b>text_analyzed</b><br/>Term: 'title__bike'"]
-        D["Condition:<br/>stock_level > 5"] --> D_Out["RangeQuery on <b>number_field</b><br/>Range: ('stock_level__' + encoded(5), infinity)"]
+        A["Condition:<br/>title = 'bike'"] --> A_Out["TermQuery on <b>text_analyzed</b><br/>Term: 'title__bike'"]
+        B["Condition:<br/>stock_level > 5"] --> B_Out["RangeQuery on <b>number_field</b><br/>Range: ('stock_level__' + encoded(5), infinity)"]
         
-        C_Out --> G["<b>B. Combine into a BooleanQuery</b>"]
-        D_Out --> G
+        A_Out --> C["<b>A. Combine into a BooleanQuery</b>"]
+        B_Out --> C
 
-        G --> H["{<br/>&nbsp;&nbsp;<b>MUST:</b> [ <br/>&nbsp;&nbsp;&nbsp;&nbsp;{ TermQuery for 'title__bike' },<br/>&nbsp;&nbsp;&nbsp;&nbsp;{ RangeQuery on 'stock_level' }<br/>&nbsp;&nbsp;]<br/>}"]
+        C --> D["{<br/>&nbsp;&nbsp;<b>MUST:</b> [ <br/>&nbsp;&nbsp;&nbsp;&nbsp;{ TermQuery for 'title__bike' },<br/>&nbsp;&nbsp;&nbsp;&nbsp;{ RangeQuery on 'stock_level' }<br/>&nbsp;&nbsp;]<br/>}"]
         
-        H --> I["<b>C. Execute Filter against Inverted Index</b><br/>(produces a set of matching doc IDs)"]
+        D --> E["<b>B. Execute Filter against Inverted Index</b><br/>(produces a set of matching doc IDs)"]
     end
 
-    I -- "Matching doc IDs" --> Step2_Subgraph
+    E -- "Matching doc IDs" --> Step2_Subgraph
 
     subgraph Step2_Subgraph ["<b>Step 2: Retrieve Sort Keys and Sort</b>"]
-        K["<b>D. Fetch 'stock_level' values for sorting</b><br/>(from <b>Columnar Store</b> using doc IDs)"]
-        L["<b>E. Sort doc IDs</b><br/>(based on fetched values)"]
-        K --> L
+        F["<b>C. Fetch 'stock_level' values for sorting</b><br/>(from <b>Columnar Store</b> using doc IDs)"]
+        G["<b>D. Sort doc IDs</b><br/>(based on fetched values)"]
+        F --> G
     end
 
-    L -- "Sorted doc IDs" --> J["<b>Final Doc IDs</b>"]
+    G -- "Sorted doc IDs" --> H["<b>Final Doc IDs</b>"]
 ```
 
 ### Understanding Analyzers
