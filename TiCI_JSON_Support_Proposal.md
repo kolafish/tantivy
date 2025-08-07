@@ -25,17 +25,18 @@ To provide a clear and powerful interface that feels native to the TiDB/MySQL ec
 
 ### 🔨 Table and Index Definition
 
-First, define a `FULLTEXT` index on your `JSON` column. The `COMMENT` clause is used to pass TiCI-specific configuration, such as custom analyzers for different JSON paths.
+First, define a `FULLTEXT` index on your `JSON` column. The `PARAMETER` clause is used to pass TiCI-specific configuration, such as custom analyzers for different JSON paths.
 
 ```sql
 CREATE TABLE products (
   id BIGINT PRIMARY KEY,
   data JSON,
-  FULLTEXT INDEX idx_product_data (data) COMMENT 'tici:{
+  FULLTEXT INDEX idx_product_data (data) PARAMETER 'tici:{
     "default_analyzer": "standard",
     "path_configs": [
       {"path": "$.product_code", "analyzer": "keyword"},
-      {"path": "$.title", "analyzer": "english_stemmer"}
+      {"path": "$.title", "analyzer": "english_stemmer"},
+      {"path": "$.phone_numbers[*]", "analyzer": "edge_ngram_3_10"}
     ]
   }'
 );
@@ -47,41 +48,79 @@ CREATE TABLE products (
 {
   "title": "Awesome Steel Bike",
   "product_code": "BK-R93R-44",
-  "stock_level": 8
+  "stock_level": 8,
+  "on_sale": true,
+  "tags": ["bicycle", "sports", "outdoors"],
+  "phone_numbers": ["13812345678", "15987654321"],
+  "release_date": "2023-05-01T10:00:00Z"
 }
 ```
 
 ### 🔍 Query Examples
 
-#### 1. Text Search with Sorting and Filtering
+#### 1. Text Search with Sorting and Pagination
 
-Find products matching "bike" with a stock level greater than 5, and order by stock level.
-The `WHERE` and `ORDER BY` clauses are both accelerated by TiCI.
+Find products matching "bike", order by release date, and return the top 10. The `ORDER BY` on `release_date` is accelerated by TiCI.
 
 ```sql
-SELECT id, data->>'$.title', data->>'$.stock_level'
+SELECT id, data->>'$.title'
 FROM products
 WHERE fts_match_word(data, '$.title', 'bike')
-  AND fts_range(data, '$.stock_level') > 5
-ORDER BY data->>'$.stock_level' DESC;
+ORDER BY data->>'$.release_date' DESC
+LIMIT 10;
 ```
 
-#### 2. Exact Match
+#### 2. Combined Exact Match and Range Filter
 
-Find products with a specific product code.
+Find bikes in stock that are not on sale. Both conditions are pushed down to TiCI.
 
 ```sql
 SELECT * FROM products
-WHERE fts_match_word(data, '$.product_code', 'BK-R93R-44');
+WHERE fts_match_word(data, '$.on_sale', 'false')
+  AND fts_range(data, '$.stock_level') > 0;
 ```
 
-#### 3. Checking for Field Existence
+#### 3. Searching within an Array (`NOT IN` equivalent)
+
+Find products tagged "sports" but not "outdoors".
+
+```sql
+SELECT * FROM products
+WHERE fts_match_word(data, '$.tags', 'sports')
+  AND NOT fts_match_word(data, '$.tags', 'outdoors');
+```
+
+#### 4. Checking for NULL values
 
 Find products where the `product_code` field exists and is not null.
 
 ```sql
 SELECT * FROM products
 WHERE fts_exists(data, '$.product_code');
+```
+
+#### 5. Prefix Search on an Array of Strings
+
+Find a product by the prefix of a phone number.
+
+```sql
+SELECT * FROM products
+WHERE fts_match_prefix(data, '$.phone_numbers', '138123');
+```
+
+#### 6. Complex Combined Query
+
+Find outdoor products that are on sale, have a stock level between 5 and 20, and have a product code that starts with "BK-". Order the results by most recently released.
+
+```sql
+SELECT id, data->>'$.title', data->>'$.stock_level'
+FROM products
+WHERE
+  fts_match_word(data, '$.tags', 'outdoors')
+  AND fts_match_word(data, '$.on_sale', 'true')
+  AND fts_match_prefix(data, '$.product_code', 'BK-')
+  AND fts_range(data, '$.stock_level') BETWEEN 5 AND 20
+ORDER BY data->>'$.release_date' DESC;
 ```
 
 ---
@@ -92,10 +131,21 @@ WHERE fts_exists(data, '$.product_code');
 
 TiCI processes JSON by flattening it into path-value pairs. Based on your configuration, it applies specific analyzers to each path, converting values into indexed terms for fast retrieval. This indexing process is the key to accelerating queries on all data types.
 
+For the diagrams below, we will use a simplified JSON document to illustrate the core concepts clearly.
+
+**Simplified JSON for Diagrams:**
+```json
+{
+  "title": "Awesome Steel Bike",
+  "product_code": "BK-R93R-44",
+  "stock_level": 8
+}
+```
+
 **Diagram A: The Indexing Pipeline**
 ```mermaid
 graph TD
-    subgraph "Input: Example JSON Document"
+    subgraph "Input: Simplified JSON Document"
         A["{<br/>'title': 'Awesome Steel Bike',<br/>'product_code': 'BK-R93R-44',<br/>'stock_level': 8<br/>}"]
     end
 
@@ -202,23 +252,21 @@ While filtering on JSON fields is straightforward, sorting (`ORDER BY`) introduc
 
 At its core, TiCI's inverted index is designed for incredibly fast filtering. It can quickly find all documents that contain a specific value (e.g., `product_code = 'BK-R93R-44'`). However, sorting requires a different access pattern. To sort results, the system needs to look up the value of the `ORDER BY` field for *every document* that matches the `WHERE` clause.
 
-When sorting by a top-level TiDB column (e.g., `ORDER BY id`), this is extremely fast. But with JSON, the field being sorted on (`data->>'$.stock_level'`) is just one of potentially hundreds of different keys within a single JSON object.
-
-Because all these different JSON paths and values are indexed together, finding the specific value for `stock_level` for a given document requires an inefficient scan-and-check process for each row in the result set. This can significantly slow down queries on large datasets.
+When sorting by a top-level TiDB column (e.g., `ORDER BY id`), this is extremely fast. But with JSON, the field being sorted on (`data->>'$.stock_level'`) is just one of potentially hundreds of different keys within a single JSON object. To provide maximum flexibility, TiCI maps all JSON paths of the same data type (like numbers) into a single, shared internal field. This means that to find the `stock_level` value for sorting, the system must scan through all numeric values in the document (e.g., `price`, `rating`, `stock_level`) to find the right one. This scan-and-check process for every matched row can significantly slow down queries on large datasets.
 
 **The Solutions: Explicit Configuration for Optimal Performance**
 
-To guarantee the high-speed sorting that users expect, we provide two robust solutions. Both approaches work by moving the sort key out of the dynamic JSON structure and into a dedicated, optimized field.
+To guarantee the high-speed sorting that users expect, we provide two robust solutions. Both approaches work by moving the sort key out of the dynamic, shared internal field and into a dedicated, optimized structure.
 
 **1. Recommended: Explicitly Configure Sortable Fields in TiCI**
 
-The most powerful and recommended approach is to tell TiCI which JSON fields you intend to sort by. You can do this with a `sortable_fields` configuration in the `COMMENT` of your index definition.
+The most powerful and recommended approach is to tell TiCI which JSON fields you intend to sort by. You can do this with a `sortable_fields` configuration in the `PARAMETER` of your index definition.
 
 ```sql
 CREATE TABLE products (
   id BIGINT PRIMARY KEY,
   data JSON,
-  FULLTEXT INDEX idx_product_data (data) COMMENT 'tici:{
+  FULLTEXT INDEX idx_product_data (data) PARAMETER 'tici:{
     ... -- other configs
     "sortable_fields": {
       "stock": {"path": "$.stock_level", "type": "f64"},
@@ -229,22 +277,23 @@ CREATE TABLE products (
 ```
 
 **How it Works:**
-When you declare a field as "sortable," TiCI creates a dedicated, high-performance columnar storage for just that field behind the scenes. When you run a query with `ORDER BY data->>'$.stock_level'`, TiCI automatically uses this optimized storage, resulting in extremely fast sorting performance that is on par with sorting on a native TiDB column.
+When you declare a field as "sortable," TiCI creates a dedicated, high-performance columnar storage (a "fast field") for just that field behind the scenes. The raw value is stored directly in this field **without any path prefix encoding.** When you run a query with `ORDER BY data->>'$.stock_level'`, TiCI automatically uses this optimized storage, resulting in extremely fast sorting performance.
 
-**2. Alternative: Use Generated Columns in TiDB**
+**2. Alternative: Use Generated Columns**
 
-If you prefer to manage schema at the TiDB level, you can use a standard `GENERATED ALWAYS AS` column to extract the sortable field from the JSON.
+If you prefer to manage schema at the TiDB level, you can use a standard `GENERATED ALWAYS AS` column to extract the sortable field from the JSON. You must then include this generated column in your `FULLTEXT` index definition.
 
 ```sql
 ALTER TABLE products ADD COLUMN stock_level_generated BIGINT
   AS (data->>'$.stock_level') STORED;
 
--- Create a standard TiDB index for sorting
-CREATE INDEX idx_stock_level on products(stock_level_generated);
+-- The generated column MUST be included in the FTS index
+CREATE FULLTEXT INDEX idx_product_data_with_sort
+  ON products(data, stock_level_generated);
 ```
 
 **How it Works:**
-With this approach, you simply use the generated column in your `ORDER BY` clause. TiDB will use its standard B-Tree index to provide efficient sorting.
+When the generated column is part of the `FULLTEXT` index, TiCI automatically creates a dedicated fast field for it, just as it does for `sortable_fields`. When you `ORDER BY stock_level_generated`, TiCI leverages this dedicated fast field for high-performance sorting.
 
 ```sql
 SELECT id, data->>'$.title'
@@ -259,7 +308,7 @@ By requiring this explicit configuration, we ensure that every `ORDER BY` operat
 
 *   **Flattened Data Model**: The index "flattens" arrays of objects. This means parent-child relationships within a nested structure are not preserved in the index, which can lead to false positives when querying across multiple fields of a nested object. For example, if you have `variants: [{color: "red", size: "L"}, {color: "blue", size: "M"}]`, a query for `color: "red" AND size: "M"` would match.
 
-*   **Static Type Inference**: The type of a field (e.g., text, number) is inferred during the first ingestion and remains fixed. A field that contains both `"123"` and `123` will be treated as either text or numeric based on the first value seen, and subsequent documents must conform.
+*   **Dynamic Typing**: TiCI embraces the flexibility of JSON. The type of a field is determined on a per-document basis. This means a given JSON path (e.g., `$.user_id`) can contain a number in one document (`12345`) and a string in another (`"user-abc"`). TiCI indexes each value according to its actual type. Queries for a specific type (e.g., a range query on numbers) will only consider documents where the path contains a matching type and will ignore others, without performing any automatic type conversion.
 
 *   **No Phrase Matching**: The initial version will support single-term matching via `fts_match_word`. Support for multi-term phrase queries is planned for a future release.
 
