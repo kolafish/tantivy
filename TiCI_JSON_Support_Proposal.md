@@ -17,6 +17,7 @@ To provide a clear and powerful interface that feels native to the TiDB/MySQL ec
 ### Proposed Functions:
 
 *   `fts_match_word(json_col, path, query_text)`: The primary function for single-term matching.
+*   `fts_match_scalar(json_col, path, query_value)`: A precise equality match function for scalar fields such as numeric and date fields.
 *   `fts_range(json_col, path)`: A marker for accelerating range queries on numeric and date fields. It is used in conjunction with standard SQL operators (`>`, `<`, `BETWEEN`).
 *   `fts_exists(json_col, path)`: A boolean function to check if a given JSON path exists and is not `null`.
 

@@ -322,8 +322,8 @@ impl FixedJsonLayer {
                     TextFieldIndexing::default()
                         .set_tokenizer("path_prefix") // 使用自定义分词器！
                         .set_index_option(IndexRecordOption::Basic),
-                )
-                .set_stored(),
+                ),
+                // .set_stored(),
         );
 
         let text_raw_field = schema_builder.add_text_field(
@@ -333,8 +333,8 @@ impl FixedJsonLayer {
                     TextFieldIndexing::default()
                         .set_tokenizer("raw")
                         .set_index_option(IndexRecordOption::Basic),
-                )
-                .set_stored(),
+                ),
+                // .set_stored(),
         );
 
         // N-gram 字段
@@ -351,11 +351,11 @@ impl FixedJsonLayer {
         // 以便存储 `path + encoded_value` 并支持范围查询
         let number_field = schema_builder.add_bytes_field(
             "json_number",
-            BytesOptions::default().set_indexed().set_fast(),
+            BytesOptions::default().set_indexed(),
         );
         let date_field = schema_builder.add_bytes_field(
             "json_date",
-            BytesOptions::default().set_indexed().set_fast(),
+            BytesOptions::default().set_indexed(),
         );
 
         let schema = schema_builder.build();

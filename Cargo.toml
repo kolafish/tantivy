@@ -89,6 +89,7 @@ time = { version = "0.3.10", features = ["serde-well-known", "macros"] }
 postcard = { version = "1.0.4", features = [
   "use-std",
 ], default-features = false }
+clap = { version = "4.0", features = ["derive"] }
 
 [target.'cfg(not(windows))'.dev-dependencies]
 criterion = { version = "0.5", default-features = false }
