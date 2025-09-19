@@ -381,10 +381,10 @@ fn run_queries(index_path: &str) -> tantivy::Result<()> {
     // Run only the four analyzed query specs
     println!("\n=== Running query specs ===");
     let specs = vec![
-        QuerySpec { severity_text: "INFO".to_string(), body_token: "blk".to_string(), ts_start: 1441123692, ts_end: 1467287851, tenant_start: 1, tenant_end: 100 },
-        QuerySpec { severity_text: "WARN".to_string(), body_token: "108841162".to_string(), ts_start: 1441170628, ts_end: 1467287851, tenant_start: 20, tenant_end: 81 },
-        QuerySpec { severity_text: "INFO".to_string(), body_token: "dest".to_string(), ts_start: 1461506660, ts_end: 1467287851, tenant_start: 40, tenant_end: 60 },
-        QuerySpec { severity_text: "INFO".to_string(), body_token: "hdfs".to_string(), ts_start: 1462238950, ts_end: 1467287851, tenant_start: 49, tenant_end: 51 },
+        QuerySpec { severity_text: "INFO".to_string(), body_token: "blk".to_string(), ts_start: 1441123692, ts_end: 1467287851, tenant_start: 10, tenant_end: 100 },
+        QuerySpec { severity_text: "INFO".to_string(), body_token: "108841162".to_string(), ts_start: 1455170628, ts_end: 1467287851, tenant_start: 30, tenant_end: 61 },
+        QuerySpec { severity_text: "INFO".to_string(), body_token: "dest".to_string(), ts_start: 1461506660, ts_end: 1467287851, tenant_start: 40, tenant_end: 55 },
+        QuerySpec { severity_text: "INFO".to_string(), body_token: "hdfs".to_string(), ts_start: 1462238950, ts_end: 1467287851, tenant_start: 40, tenant_end: 51 },
     ];
     for (i, spec) in specs.iter().enumerate() {
         println!("\n--- Query Spec {} ---", i + 1);
@@ -418,44 +418,14 @@ fn run_queries(index_path: &str) -> tantivy::Result<()> {
             (Occur::Must, Box::new(ten_range)),
         ]);
 
-        // Measure latency for top-100 using fast field sort by timestamp desc,
-        // and apply secondary tie-break by tenant_id asc only for docs with equal timestamp at the cutoff.
+        // Measure latency for top-100 using fast field sort by timestamp desc only
         let t0 = Instant::now();
-        let mut collected: Vec<(i64, tantivy::DocAddress)> = Vec::new();
-        let mut offset = 0;
-        let batch = 256; // small batches; still using fast field order
-        let mut cutoff_ts: Option<i64> = None;
-        loop {
-            let batch_docs: Vec<(i64, tantivy::DocAddress)> = searcher.search(
-                &query,
-                &TopDocs::with_limit(batch).and_offset(offset).order_by_fast_field("timestamp", Order::Desc),
-            )?;
-            if batch_docs.is_empty() { break; }
-            collected.extend_from_slice(&batch_docs);
-            if collected.len() >= 100 {
-                cutoff_ts = Some(collected[99].0);
-            }
-            // Stop when we have at least 100 and the last doc has timestamp strictly less than cutoff
-            if let Some(cut) = cutoff_ts {
-                let last_ts = collected.last().map(|x| x.0).unwrap_or(cut);
-                if last_ts < cut { break; }
-            }
-            offset += batch;
-            if collected.len() > 5000 { break; } // safety cap
-        }
-        // Separate docs >= cutoff_ts, then tie-break equal timestamps by tenant_id asc, and take 100
-        let cut = cutoff_ts.unwrap_or_else(|| collected.last().map(|x| x.0).unwrap_or(i64::MIN));
-        let mut top_slice: Vec<(i64, u64)> = Vec::new();
-        for (ts, addr) in collected.into_iter() {
-            if ts < cut { break; }
-            let doc: TantivyDocument = searcher.doc(addr)?;
-            let ten_v = doc.get_first(ten_field).and_then(|v| v.as_u64()).unwrap_or(0);
-            top_slice.push((ts, ten_v));
-        }
-        top_slice.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-        let _top100: Vec<(i64, u64)> = top_slice.into_iter().take(100).collect();
+        let _top_docs: Vec<(i64, tantivy::DocAddress)> = searcher.search(
+            &query,
+            &TopDocs::with_limit(100).order_by_fast_field("timestamp", Order::Desc),
+        )?;
         let latency_ms = t0.elapsed().as_millis();
-        println!("Top-100 latency (timestamp desc, tenant_id asc tie-break): {} ms", latency_ms);
+        println!("Top-100 latency (timestamp desc): {} ms", latency_ms);
 
         // Count(*) with custom collector
         let t1 = Instant::now();
@@ -490,6 +460,7 @@ fn main() -> tantivy::Result<()> {
                 eprintln!("Please run with --mode index first to build the index");
                 std::process::exit(1);
             }
+            run_queries(&args.index_path)?;
             run_queries(&args.index_path)?;
         }
         _ => {
