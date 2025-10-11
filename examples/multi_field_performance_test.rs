@@ -25,6 +25,7 @@ use std::time::Instant;
 use clap::Parser;
 use serde_json::Value as JsonValue;
 use tantivy::collector::{TopDocs, Count};
+use tantivy::indexer::NoMergePolicy;
 use tantivy::directory::MmapDirectory;
 use tantivy::query::{
     BooleanQuery, Occur, RangeQuery, TermQuery,
@@ -235,16 +236,16 @@ fn create_default_query_spec() -> QuerySpec {
     //     ts_start: 1455170628, ts_end: 1467287851, 
     //     tenant_start: 30, tenant_end: 61 
     // }
-    QuerySpec { 
-        severity_text: "INFO".to_string(), body_token: "dest".to_string(), 
-        ts_start: 1461506660, ts_end: 1467287851, 
-        tenant_start: 40, tenant_end: 55 
-    }
     // QuerySpec { 
-    //     severity_text: "INFO".to_string(), body_token: "hdfs".to_string(), 
-    //     ts_start: 1462238950, ts_end: 1467287851, 
-    //     tenant_start: 40, tenant_end: 51 
+    //     severity_text: "INFO".to_string(), body_token: "dest".to_string(), 
+    //     ts_start: 1461506660, ts_end: 1467287851, 
+    //     tenant_start: 40, tenant_end: 55 
     // }
+    QuerySpec { 
+        severity_text: "INFO".to_string(), body_token: "hdfs".to_string(), 
+        ts_start: 1462238950, ts_end: 1467287851, 
+        tenant_start: 40, tenant_end: 51 
+    }
 }
 
 fn load_index_and_validate(index_path: &str, index_type: &str) -> tantivy::Result<(Index, Searcher, Schema)> {
@@ -433,14 +434,18 @@ fn build_time_sorted_index(data_path: &str, index_path: &str, max_docs: usize) -
               segment_count, chunk_docs.len(), chunk_start, chunk_end - 1);
         
         
-        // 为每个segment创建新的IndexWriter
+        // 为每个segment创建新的IndexWriter，禁用自动合并
         let mut index_writer = index.writer_with_options(
             tantivy::indexer::IndexWriterOptions::builder()
-                .memory_budget_per_thread(500_000_000)
+                .memory_budget_per_thread(1000_000_000)
                 .num_worker_threads(1)
-                .num_merge_threads(1)
+                .num_merge_threads(0)  // 禁用合并线程
                 .build()
         )?;
+        
+        // 设置无合并策略，防止自动合并
+        index_writer.set_merge_policy(Box::new(NoMergePolicy));
+        info!("Set NoMergePolicy for segment {} to prevent automatic merging", segment_count);
         
         // 写入当前segment的文档
         for (i, log_entry) in chunk_docs.iter().enumerate() {
