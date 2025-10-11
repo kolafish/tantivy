@@ -225,14 +225,26 @@ fn print_query_results(results: &[(i64, u64, tantivy::DocAddress)], title: &str)
 }
 
 fn create_default_query_spec() -> QuerySpec {
+    // QuerySpec { 
+    //     severity_text: "INFO".to_string(), body_token: "blk".to_string(), 
+    //     ts_start: 1441123692, ts_end: 1467287851, 
+    //     tenant_start: 10, tenant_end: 100 
+    // }
+    // QuerySpec { 
+    //     severity_text: "INFO".to_string(), body_token: "108841162".to_string(), 
+    //     ts_start: 1455170628, ts_end: 1467287851, 
+    //     tenant_start: 30, tenant_end: 61 
+    // }
     QuerySpec { 
-        severity_text: "INFO".to_string(), 
-        body_token: "blk".to_string(), 
-        ts_start: 1441123692, 
-        ts_end: 1467287750, 
-        tenant_start: 10, 
-        tenant_end: 73 
+        severity_text: "INFO".to_string(), body_token: "dest".to_string(), 
+        ts_start: 1461506660, ts_end: 1467287851, 
+        tenant_start: 40, tenant_end: 55 
     }
+    // QuerySpec { 
+    //     severity_text: "INFO".to_string(), body_token: "hdfs".to_string(), 
+    //     ts_start: 1462238950, ts_end: 1467287851, 
+    //     tenant_start: 40, tenant_end: 51 
+    // }
 }
 
 fn load_index_and_validate(index_path: &str, index_type: &str) -> tantivy::Result<(Index, Searcher, Schema)> {
