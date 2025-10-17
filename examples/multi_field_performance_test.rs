@@ -28,10 +28,11 @@ use tantivy::collector::{TopDocs, Count};
 use tantivy::indexer::NoMergePolicy;
 use tantivy::directory::MmapDirectory;
 use tantivy::query::{
-    BooleanQuery, Occur, RangeQuery, TermQuery,
+    BooleanQuery, Occur, TermQuery, InvertedIndexRangeQuery, FastFieldRangeQuery,
 };
 use tantivy::schema::*;
-use tantivy::{doc, Index, IndexWriter, Order, ReloadPolicy, Searcher, TantivyDocument};
+use tantivy::{doc, Index, IndexWriter, Order, ReloadPolicy, Searcher, TantivyDocument, TERMINATED};
+use tantivy::query::EnableScoring;
 use tantivy::indexer::IndexWriterOptions;
 mod segment_query_executor;
 use segment_query_executor::SegmentQueryExecutor;
@@ -71,6 +72,15 @@ struct Args {
     /// Query execution method: 'segment_by_segment' or 'all_segments' (default: 'all_segments')
     #[arg(long, default_value = "all_segments")]
     query_method: String,
+
+    /// Range query implementation: 'fast_field' or 'inverted_index' (default: 'fast_field')
+    #[arg(long, default_value = "fast_field")]
+    range_query_impl: String,
+
+    /// Auto mode: max terms to scan from term dictionary before capping
+    #[arg(long, default_value_t = 8192)]
+    auto_term_cap: u64,
+
 }
 
 #[derive(Debug)]
@@ -92,7 +102,7 @@ fn parse_log_entry(line: &str) -> Option<LogEntry> {
     })
 }
 
-fn create_schema() -> Schema {
+fn create_schema(use_fast_field: bool) -> Schema {
     let mut schema_builder = Schema::builder();
     
     // Text fields for full-text search
@@ -101,6 +111,7 @@ fn create_schema() -> Schema {
     
     // Fast fields for filtering and sorting
     schema_builder.add_u64_field("tenant_id", INDEXED | FAST | STORED);
+    
     schema_builder.add_i64_field("timestamp", INDEXED | FAST | STORED);
     
     schema_builder.build()
@@ -141,7 +152,7 @@ fn ensure_index_directory_clean(index_path: &str) -> tantivy::Result<()> {
 }
 
 fn create_index_with_schema(index_path: &str) -> tantivy::Result<Index> {
-    let schema = create_schema();
+    let schema = create_schema(true); // 默认使用 fast field
     info!("Schema created with {} fields", schema.fields().count());
     
     // 确保索引目录存在且干净
@@ -154,7 +165,74 @@ fn create_index_with_schema(index_path: &str) -> tantivy::Result<Index> {
     Ok(index)
 }
 
-fn build_common_query(schema: &Schema, spec: &QuerySpec) -> BooleanQuery {
+// Defaults for auto strategy
+const DEFAULT_ESTIMATE_TERM_CNT_LIMIT: u64 = 8192; // used for logging (capped) only
+const RATIO_THRESH: f64 = 0.02; // 2%: use inverted if ratio < 2%, else fast_field
+
+fn estimate_range_cost(
+    searcher: &Searcher,
+    field: Field,
+    lower: &Term,
+    upper: &Term,
+    max_terms_to_scan: u64,
+    total_docs: u64,
+    ratio_thresh: f64,
+) -> tantivy::Result<(u64, u64, u64, bool, bool)> {
+    // Returns (terms_scanned_for_log, full_range_terms, sum_doc_freq, sum_posting_bytes, capped)
+    let mut terms_scanned = 0u64; // up to cap, for logging
+    let mut full_range_terms = 0u64; // true total range terms across all segments
+    let mut sum_df = 0u64;
+    let mut sum_post_bytes = 0u64;
+    let mut capped = false;
+
+    // Use integer arithmetic to avoid FP precision when deciding
+    const RATIO_NUM: u64 = 2; // 2%
+    const RATIO_DEN: u64 = 100;
+    let target_num: u128 = (total_docs as u128) * (RATIO_NUM as u128);
+    let mut early_stopped = false;
+    for segment_reader in searcher.segment_readers() {
+        let inverted_index = segment_reader.inverted_index(field)?;
+        let term_dict = inverted_index.terms();
+        let mut builder = term_dict.range();
+        builder = builder
+            .ge(lower.serialized_value_bytes())
+            .le(upper.serialized_value_bytes());
+        let mut stream = builder.into_stream()?;
+        while stream.advance() {
+            let info = stream.value();
+            // Always accumulate df/bytes and full term count for accuracy even if capped
+            sum_df += info.doc_freq as u64;
+            sum_post_bytes += info.postings_range.len() as u64;
+            full_range_terms += 1;
+            if terms_scanned < max_terms_to_scan {
+                terms_scanned += 1;
+            } else {
+                capped = true;
+            }
+            // Early stop once ratio threshold is exceeded
+            if (sum_df as u128) * (RATIO_DEN as u128) >= target_num {
+                early_stopped = true;
+                break;
+            }
+        }
+        if early_stopped {
+            break;
+        }
+    }
+    // Decide using integer comparison: use FF if ratio >= 2%
+    let use_ff = !((sum_df as u128) * (RATIO_DEN as u128) < target_num);
+    Ok((terms_scanned, sum_df, sum_post_bytes, capped, use_ff))
+}
+
+// Ratio-only rule is applied inline where needed.
+
+fn build_common_query(
+    searcher: &Searcher,
+    schema: &Schema,
+    spec: &QuerySpec,
+    range_query_impl: &str,
+    auto_term_cap: u64,
+) -> BooleanQuery {
     let sev_field = schema.get_field("severity_text").unwrap();
     let body_field = schema.get_field("body").unwrap();
     let ts_field = schema.get_field("timestamp").unwrap();
@@ -166,26 +244,495 @@ fn build_common_query(schema: &Schema, spec: &QuerySpec) -> BooleanQuery {
     let body_term = Term::from_field_text(body_field, &spec.body_token.to_ascii_lowercase());
     let body_query = TermQuery::new(body_term, IndexRecordOption::Basic);
 
-    let ts_range = RangeQuery::new(
-        Bound::Included(Term::from_field_i64(ts_field, spec.ts_start)),
-        Bound::Included(Term::from_field_i64(ts_field, spec.ts_end)),
-    );
+    // Decide implementation per field
+    let (use_ff_ts, use_ff_tenant) = match range_query_impl {
+        "fast_field" => (true, true),
+        "inverted_index" => (false, false),
+        "auto" => {
+            let total_docs = searcher.num_docs() as u64;
+            // timestamp estimation with early stop and timing
+            let ts_lower = Term::from_field_i64(ts_field, spec.ts_start);
+            let ts_upper = Term::from_field_i64(ts_field, spec.ts_end);
+            let t0 = Instant::now();
+            let (ts_terms_scanned, ts_sum_df, ts_post_bytes, ts_capped, use_ff_ts) =
+                estimate_range_cost(searcher, ts_field, &ts_lower, &ts_upper, auto_term_cap, total_docs, RATIO_THRESH)
+                    .unwrap_or((0, 0, 0, false, false));
+            let ts_est_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            let ts_ratio = (ts_sum_df as f64) / ((total_docs as f64) + 1e-9);
 
-    let ten_range = RangeQuery::new(
-        Bound::Included(Term::from_field_u64(ten_field, spec.tenant_start)),
-        Bound::Included(Term::from_field_u64(ten_field, spec.tenant_end)),
-    );
+            // tenant estimation with early stop and timing
+            let ten_lower = Term::from_field_u64(ten_field, spec.tenant_start);
+            let ten_upper = Term::from_field_u64(ten_field, spec.tenant_end);
+            let t1 = Instant::now();
+            let (ten_terms_scanned, ten_sum_df, ten_post_bytes, ten_capped, use_ff_tenant) =
+                estimate_range_cost(searcher, ten_field, &ten_lower, &ten_upper, auto_term_cap, total_docs, RATIO_THRESH)
+                    .unwrap_or((0, 0, 0, false, false));
+            let ten_est_ms = t1.elapsed().as_secs_f64() * 1000.0;
+            let ten_ratio = (ten_sum_df as f64) / ((total_docs as f64) + 1e-9);
+
+            println!("[auto] timestamp: terms_scanned={}{} sum_doc_freq={} ratio={:.3}% postings_bytes={} est_ms={:.2} -> {}",
+                ts_terms_scanned,
+                if ts_capped { " (capped)" } else { "" },
+                ts_sum_df,
+                ts_ratio * 100.0,
+                ts_post_bytes,
+                ts_est_ms,
+                if use_ff_ts { "fast_field" } else { "inverted_index" }
+            );
+            println!("[auto] tenant_id: terms_scanned={}{} sum_doc_freq={} ratio={:.3}% postings_bytes={} est_ms={:.2} -> {}",
+                ten_terms_scanned,
+                if ten_capped { " (capped)" } else { "" },
+                ten_sum_df,
+                ten_ratio * 100.0,
+                ten_post_bytes,
+                ten_est_ms,
+                if use_ff_tenant { "fast_field" } else { "inverted_index" }
+            );
+
+            (use_ff_ts, use_ff_tenant)
+        }
+        _ => (true, true),
+    };
+
+    // Build per-field range queries
+    let ts_range: Box<dyn tantivy::query::Query> = if use_ff_ts {
+        Box::new(FastFieldRangeQuery::new(
+            Bound::Included(Term::from_field_i64(ts_field, spec.ts_start)),
+            Bound::Included(Term::from_field_i64(ts_field, spec.ts_end)),
+        ))
+    } else {
+        Box::new(InvertedIndexRangeQuery::new(
+            Bound::Included(Term::from_field_i64(ts_field, spec.ts_start)),
+            Bound::Included(Term::from_field_i64(ts_field, spec.ts_end)),
+        ))
+    };
+
+    let ten_range: Box<dyn tantivy::query::Query> = if use_ff_tenant {
+        Box::new(FastFieldRangeQuery::new(
+            Bound::Included(Term::from_field_u64(ten_field, spec.tenant_start)),
+            Bound::Included(Term::from_field_u64(ten_field, spec.tenant_end)),
+        ))
+    } else {
+        Box::new(InvertedIndexRangeQuery::new(
+            Bound::Included(Term::from_field_u64(ten_field, spec.tenant_start)),
+            Bound::Included(Term::from_field_u64(ten_field, spec.tenant_end)),
+        ))
+    };
 
     BooleanQuery::new(vec![
         (Occur::Must, Box::new(sev_query)),
         (Occur::Must, Box::new(body_query)),
-        (Occur::Must, Box::new(ts_range)),
-        (Occur::Must, Box::new(ten_range)),
+        (Occur::Must, ts_range),
+        (Occur::Must, ten_range),
     ])
 }
 
-fn run_common_queries(searcher: &Searcher, schema: &Schema, spec: &QuerySpec) -> tantivy::Result<()> {
-    let query = build_common_query(schema, spec);
+/// 统计 RangeQuery 中的 term 数量和每个 term 的 hint size
+fn analyze_range_query_terms(
+    searcher: &Searcher,
+    field: Field,
+    lower_bound: &Term,
+    upper_bound: &Term,
+    prefilter_query: Option<&dyn tantivy::query::Query>,
+) -> tantivy::Result<RangeQueryStats> {
+    let mut total_terms = 0;
+    let mut total_doc_freq = 0;
+    let mut total_posting_bytes = 0;
+    let mut total_position_bytes = 0;
+    let mut term_details = Vec::new();
+
+    // 构造（可选）预过滤权重：用于将其它过滤条件变为每段的 DocSet 掩码
+    let weight_opt = if let Some(q) = prefilter_query {
+        Some(q.weight(EnableScoring::disabled_from_searcher(searcher))?)
+    } else {
+        None
+    };
+
+    for segment_reader in searcher.segment_readers() {
+        // 将预过滤 DocSet 物化为当前段的有序 doc 列表
+        let filter_docs: Option<Vec<u32>> = if let Some(ref weight) = weight_opt {
+            let mut scorer = weight.scorer(segment_reader, 1.0)?;
+            let mut docs = Vec::new();
+            let mut doc = scorer.doc();
+            while doc != TERMINATED {
+                docs.push(doc);
+                doc = scorer.advance();
+            }
+            Some(docs)
+        } else {
+            None
+        };
+
+        let inverted_index = segment_reader.inverted_index(field)?;
+        let term_dict = inverted_index.terms();
+
+        // 创建 term range stream
+        let mut term_stream_builder = term_dict.range();
+        term_stream_builder = term_stream_builder
+            .ge(lower_bound.serialized_value_bytes())
+            .le(upper_bound.serialized_value_bytes());
+        let mut term_range = term_stream_builder.into_stream()?;
+
+        while term_range.advance() {
+            let term_info = term_range.value();
+            let term_bytes = term_range.key();
+
+            if filter_docs.is_none() {
+                // 无预过滤：直接统计范围内的全部 terms（term dict 中仅包含出现过的 term）。
+                total_terms += 1;
+                total_doc_freq += term_info.doc_freq as u64;
+                total_posting_bytes += term_info.postings_range.len() as u64;
+                total_position_bytes += term_info.positions_range.len() as u64;
+                term_details.push(TermDetail {
+                    term_bytes: term_bytes.to_vec(),
+                    doc_freq: term_info.doc_freq,
+                    posting_bytes: term_info.postings_range.len() as u64,
+                    position_bytes: term_info.positions_range.len() as u64,
+                });
+                continue;
+            }
+
+            // 有预过滤：遍历该 term 的倒排，与预过滤 DocSet 求交并统计交集的 doc 数
+            let mut block_postings = inverted_index
+                .read_block_postings_from_terminfo(term_info, IndexRecordOption::Basic)?;
+            let mut matched_docs: u32 = 0;
+            if let Some(ref docs_filter) = filter_docs {
+                loop {
+                    let docs = block_postings.docs();
+                    if docs.is_empty() {
+                        break;
+                    }
+                    for &doc in docs {
+                        if docs_filter.binary_search(&doc).is_ok() {
+                            matched_docs += 1;
+                        }
+                    }
+                    block_postings.advance();
+                }
+            }
+
+            if matched_docs > 0 {
+                total_terms += 1;
+                total_doc_freq += matched_docs as u64;
+                total_posting_bytes += term_info.postings_range.len() as u64;
+                total_position_bytes += term_info.positions_range.len() as u64;
+                term_details.push(TermDetail {
+                    term_bytes: term_bytes.to_vec(),
+                    doc_freq: matched_docs,
+                    posting_bytes: term_info.postings_range.len() as u64,
+                    position_bytes: term_info.positions_range.len() as u64,
+                });
+            }
+        }
+    }
+
+    Ok(RangeQueryStats {
+        total_terms,
+        total_doc_freq,
+        total_posting_bytes,
+        total_position_bytes,
+        term_details,
+    })
+}
+
+#[derive(Debug)]
+struct RangeQueryStats {
+    total_terms: u64,
+    total_doc_freq: u64,
+    total_posting_bytes: u64,
+    total_position_bytes: u64,
+    term_details: Vec<TermDetail>,
+}
+
+#[derive(Debug)]
+struct TermDetail {
+    term_bytes: Vec<u8>,
+    doc_freq: u32,
+    posting_bytes: u64,
+    position_bytes: u64,
+}
+
+fn decode_numeric_term_value(bytes: &[u8], is_i64: bool) -> String {
+    if bytes.len() == 8 {
+        let be = u64::from_be_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ]);
+        if is_i64 {
+            let val = tantivy::u64_to_i64(be);
+            format!("{}", val)
+        } else {
+            format!("{}", be)
+        }
+    } else {
+        format!("<{} bytes>", bytes.len())
+    }
+}
+
+fn print_range_diagnostics(
+    searcher: &Searcher,
+    field: Field,
+    field_label: &str,
+    lower: &Term,
+    upper: &Term,
+    is_i64: bool,
+) -> tantivy::Result<()> {
+    let mut total_terms_all_segments: u64 = 0;
+    let mut total_range_terms: u64 = 0;
+    let mut first_key_opt: Option<Vec<u8>> = None;
+    let mut last_key_opt: Option<Vec<u8>> = None;
+
+    for (seg_ord, segment_reader) in searcher.segment_readers().iter().enumerate() {
+        let inverted_index = segment_reader.inverted_index(field)?;
+        let term_dict = inverted_index.terms();
+        total_terms_all_segments += term_dict.num_terms() as u64;
+
+        let mut builder = term_dict.range();
+        builder = builder
+            .ge(lower.serialized_value_bytes())
+            .le(upper.serialized_value_bytes());
+        let mut stream = builder.into_stream()?;
+        let mut seg_range_terms = 0u64;
+        let mut seg_first: Option<Vec<u8>> = None;
+        let mut seg_last: Option<Vec<u8>> = None;
+        while stream.advance() {
+            let key = stream.key();
+            seg_range_terms += 1;
+            if seg_first.is_none() {
+                seg_first = Some(key.to_vec());
+            }
+            seg_last = Some(key.to_vec());
+        }
+        total_range_terms += seg_range_terms;
+        if let Some(ref k) = seg_first {
+            if first_key_opt.is_none() {
+                first_key_opt = Some(k.clone());
+            }
+        }
+        if let Some(k) = seg_last {
+            last_key_opt = Some(k);
+        }
+        debug!(
+            "[diag:{}] segment#{}: term_dict_total={}, range_terms={}",
+            field_label,
+            seg_ord,
+            term_dict.num_terms(),
+            seg_range_terms
+        );
+    }
+
+    let lower_val = decode_numeric_term_value(lower.serialized_value_bytes(), is_i64);
+    let upper_val = decode_numeric_term_value(upper.serialized_value_bytes(), is_i64);
+    let first_val = first_key_opt
+        .as_ref()
+        .map(|b| decode_numeric_term_value(b, is_i64))
+        .unwrap_or_else(|| "<none>".to_string());
+    let last_val = last_key_opt
+        .as_ref()
+        .map(|b| decode_numeric_term_value(b, is_i64))
+        .unwrap_or_else(|| "<none>".to_string());
+
+    println!("[diag] field='{}' range=[{}, {}]", field_label, lower_val, upper_val);
+    println!(
+        "[diag] field='{}' term_dict_total(all segments)={}, range_terms_total={}",
+        field_label, total_terms_all_segments, total_range_terms
+    );
+    println!(
+        "[diag] field='{}' first_key_in_range={}, last_key_in_range={}",
+        field_label, first_val, last_val
+    );
+
+    // Removed verbose per-term printing to keep diagnostics concise.
+
+    Ok(())
+}
+
+fn run_common_queries(searcher: &Searcher, schema: &Schema, spec: &QuerySpec, range_query_impl: &str, auto_term_cap: u64) -> tantivy::Result<()> {
+    let query = build_common_query(searcher, schema, spec, range_query_impl, auto_term_cap);
+
+    // 分析 RangeQuery 的 term 统计信息
+    println!("\n=== RangeQuery Term Analysis ===");
+    let ts_field = schema.get_field("timestamp").unwrap();
+    let ten_field = schema.get_field("tenant_id").unwrap();
+
+    // 为 term 统计构造预过滤查询：
+    // - 针对 timestamp 的统计：使用 severity_text + body + tenant_id 范围作为 prefilter
+    // - 针对 tenant_id 的统计：使用 severity_text + body + timestamp 范围作为 prefilter
+    let sev_field = schema.get_field("severity_text").unwrap();
+    let body_field = schema.get_field("body").unwrap();
+    let sev_term = Term::from_field_text(sev_field, &spec.severity_text.to_ascii_lowercase());
+    let sev_query = TermQuery::new(sev_term, IndexRecordOption::Basic);
+    let body_term = Term::from_field_text(body_field, &spec.body_token.to_ascii_lowercase());
+    let body_query = TermQuery::new(body_term, IndexRecordOption::Basic);
+
+    // 对于 auto 策略，我们按相同启发式为各字段挑选实现
+    let (use_ff_ts, use_ff_tenant) = match range_query_impl {
+        "fast_field" => (true, true),
+        "inverted_index" => (false, false),
+        "auto" => {
+            let total_docs = searcher.num_docs() as u64;
+            // ts decision via ratio-only rule
+            let (_ts_scanned, ts_sum_df, _ts_bytes, _ts_capped, use_ff_ts) = estimate_range_cost(
+                searcher,
+                ts_field,
+                &Term::from_field_i64(ts_field, spec.ts_start),
+                &Term::from_field_i64(ts_field, spec.ts_end),
+                auto_term_cap,
+                total_docs,
+                RATIO_THRESH,
+            )?;
+            // tenant decision via ratio-only rule
+            let (_ten_scanned, ten_sum_df, _ten_bytes, _ten_capped, use_ff_tenant) = estimate_range_cost(
+                searcher,
+                ten_field,
+                &Term::from_field_u64(ten_field, spec.tenant_start),
+                &Term::from_field_u64(ten_field, spec.tenant_end),
+                auto_term_cap,
+                total_docs,
+                RATIO_THRESH,
+            )?;
+            (use_ff_ts, use_ff_tenant)
+        }
+        _ => (true, true),
+    };
+
+    let ts_prefilter: Box<dyn tantivy::query::Query> = if use_ff_ts {
+        Box::new(FastFieldRangeQuery::new(
+            Bound::Included(Term::from_field_i64(ts_field, spec.ts_start)),
+            Bound::Included(Term::from_field_i64(ts_field, spec.ts_end)),
+        ))
+    } else {
+        Box::new(InvertedIndexRangeQuery::new(
+            Bound::Included(Term::from_field_i64(ts_field, spec.ts_start)),
+            Bound::Included(Term::from_field_i64(ts_field, spec.ts_end)),
+        ))
+    };
+    let tenant_prefilter: Box<dyn tantivy::query::Query> = if use_ff_tenant {
+        Box::new(FastFieldRangeQuery::new(
+            Bound::Included(Term::from_field_u64(ten_field, spec.tenant_start)),
+            Bound::Included(Term::from_field_u64(ten_field, spec.tenant_end)),
+        ))
+    } else {
+        Box::new(InvertedIndexRangeQuery::new(
+            Bound::Included(Term::from_field_u64(ten_field, spec.tenant_start)),
+            Bound::Included(Term::from_field_u64(ten_field, spec.tenant_end)),
+        ))
+    };
+
+    let prefilter_for_ts = BooleanQuery::new(vec![
+        (Occur::Must, Box::new(sev_query.clone())),
+        (Occur::Must, Box::new(body_query.clone())),
+        (Occur::Must, tenant_prefilter.box_clone()),
+    ]);
+    let prefilter_for_tenant = BooleanQuery::new(vec![
+        (Occur::Must, Box::new(sev_query)),
+        (Occur::Must, Box::new(body_query)),
+        (Occur::Must, ts_prefilter.box_clone()),
+    ]);
+
+    // 诊断打印：timestamp 与 tenant_id 的字典与范围信息
+    let ts_lower = Term::from_field_i64(ts_field, spec.ts_start);
+    let ts_upper = Term::from_field_i64(ts_field, spec.ts_end);
+    print_range_diagnostics(searcher, ts_field, "timestamp", &ts_lower, &ts_upper, true)?;
+
+    let ten_lower = Term::from_field_u64(ten_field, spec.tenant_start);
+    let ten_upper = Term::from_field_u64(ten_field, spec.tenant_end);
+    print_range_diagnostics(searcher, ten_field, "tenant_id", &ten_lower, &ten_upper, false)?;
+
+    // 分析 timestamp 字段的 RangeQuery - 所有 term
+    let ts_stats_all = analyze_range_query_terms(searcher, ts_field, &ts_lower, &ts_upper, None)?;
+
+    // 分析 timestamp 字段的 RangeQuery - 只统计与其它过滤条件相交的 term
+    let ts_stats_matching = analyze_range_query_terms(
+        searcher,
+        ts_field,
+        &ts_lower,
+        &ts_upper,
+        Some(&prefilter_for_ts),
+    )?;
+    
+    // 为了演示差异，让我们测试一个更小的范围
+    let ts_lower_small = Term::from_field_i64(ts_field, spec.ts_start);
+    let ts_upper_small = Term::from_field_i64(ts_field, spec.ts_start + 1000); // 只测试1000秒的范围
+    let ts_stats_small_all = analyze_range_query_terms(searcher, ts_field, &ts_lower_small, &ts_upper_small, None)?;
+    let ts_stats_small_matching = analyze_range_query_terms(
+        searcher,
+        ts_field,
+        &ts_lower_small,
+        &ts_upper_small,
+        Some(&prefilter_for_ts),
+    )?;
+    
+    println!("Timestamp RangeQuery Stats:");
+    println!("  All terms in range:");
+    println!("    Total terms: {}", ts_stats_all.total_terms);
+    println!("    Total doc frequency: {}", ts_stats_all.total_doc_freq);
+    println!("    Total posting bytes: {}", ts_stats_all.total_posting_bytes);
+    println!("    Total position bytes: {}", ts_stats_all.total_position_bytes);
+    println!("    Average posting bytes per term: {:.2}", 
+        if ts_stats_all.total_terms > 0 { ts_stats_all.total_posting_bytes as f64 / ts_stats_all.total_terms as f64 } else { 0.0 });
+    
+    println!("  Matching terms only (doc_freq > 0):");
+    println!("    Total terms: {}", ts_stats_matching.total_terms);
+    println!("    Total doc frequency: {}", ts_stats_matching.total_doc_freq);
+    println!("    Total posting bytes: {}", ts_stats_matching.total_posting_bytes);
+    println!("    Total position bytes: {}", ts_stats_matching.total_position_bytes);
+    println!("    Average posting bytes per term: {:.2}", 
+        if ts_stats_matching.total_terms > 0 { ts_stats_matching.total_posting_bytes as f64 / ts_stats_matching.total_terms as f64 } else { 0.0 });
+    
+    // Note: With prefilter applied, matching terms reflect intersection with other filters.
+    
+    // 显示前10个匹配 term 的详细信息
+    println!("  Top 10 matching terms by doc frequency:");
+    let mut sorted_terms = ts_stats_matching.term_details;
+    sorted_terms.sort_by(|a, b| b.doc_freq.cmp(&a.doc_freq));
+    for (i, term) in sorted_terms.iter().take(10).enumerate() {
+        let term_value = if term.term_bytes.len() == 8 {
+            // 假设是 i64 值
+            i64::from_be_bytes([term.term_bytes[0], term.term_bytes[1], term.term_bytes[2], term.term_bytes[3],
+                               term.term_bytes[4], term.term_bytes[5], term.term_bytes[6], term.term_bytes[7]])
+        } else {
+            0
+        };
+        println!("    {}: value={}, doc_freq={}, posting_bytes={}, position_bytes={}", 
+                i + 1, term_value, term.doc_freq, term.posting_bytes, term.position_bytes);
+    }
+    
+    // 显示小范围的对比
+    println!("\n  Small range comparison (1000 seconds):");
+    println!("    All terms in small range: {}", ts_stats_small_all.total_terms);
+    println!("    Matching terms in small range: {}", ts_stats_small_matching.total_terms);
+    println!("    Difference: {}", ts_stats_small_all.total_terms as i64 - ts_stats_small_matching.total_terms as i64);
+    
+    // 分析 tenant_id 字段的 RangeQuery - 所有 term
+    let ten_stats_all = analyze_range_query_terms(searcher, ten_field, &ten_lower, &ten_upper, None)?;
+    
+    // 分析 tenant_id 字段的 RangeQuery - 只统计与其它过滤条件相交的 term
+    let ten_stats_matching = analyze_range_query_terms(
+        searcher,
+        ten_field,
+        &ten_lower,
+        &ten_upper,
+        Some(&prefilter_for_tenant),
+    )?;
+    
+    println!("\nTenant ID RangeQuery Stats:");
+    println!("  All terms in range:");
+    println!("    Total terms: {}", ten_stats_all.total_terms);
+    println!("    Total doc frequency: {}", ten_stats_all.total_doc_freq);
+    println!("    Total posting bytes: {}", ten_stats_all.total_posting_bytes);
+    println!("    Total position bytes: {}", ten_stats_all.total_position_bytes);
+    println!("    Average posting bytes per term: {:.2}", 
+        if ten_stats_all.total_terms > 0 { ten_stats_all.total_posting_bytes as f64 / ten_stats_all.total_terms as f64 } else { 0.0 });
+    
+    println!("  Matching terms only (doc_freq > 0):");
+    println!("    Total terms: {}", ten_stats_matching.total_terms);
+    println!("    Total doc frequency: {}", ten_stats_matching.total_doc_freq);
+    println!("    Total posting bytes: {}", ten_stats_matching.total_posting_bytes);
+    println!("    Total position bytes: {}", ten_stats_matching.total_position_bytes);
+    println!("    Average posting bytes per term: {:.2}", 
+        if ten_stats_matching.total_terms > 0 { ten_stats_matching.total_posting_bytes as f64 / ten_stats_matching.total_terms as f64 } else { 0.0 });
+    
+    // Note: With prefilter applied, matching terms reflect intersection with other filters.
 
     // Top-100 查询
     info!("Starting search with TopDocs collector (limit=100, order by timestamp desc)");
@@ -271,12 +818,13 @@ fn load_index_and_validate(index_path: &str, index_type: &str) -> tantivy::Resul
     Ok((index, searcher, schema))
 }
 
-fn run_common_query_tests(searcher: &Searcher, schema: &Schema, spec: &QuerySpec) -> tantivy::Result<()> {
+fn run_common_query_tests(searcher: &Searcher, schema: &Schema, spec: &QuerySpec, range_query_impl: &str) -> tantivy::Result<()> {
     info!("Query parameters: severity_text='{}', body contains '{}', ts:[{},{}], tenant:[{},{}]",
           spec.severity_text, spec.body_token, spec.ts_start, spec.ts_end, spec.tenant_start, spec.tenant_end);
 
     // 运行通用查询
-    run_common_queries(searcher, schema, spec)?;
+    // Use defaults for analysis path; execution path uses args thresholds
+    run_common_queries(searcher, schema, spec, range_query_impl, DEFAULT_ESTIMATE_TERM_CNT_LIMIT)?;
     
     Ok(())
 }
@@ -515,11 +1063,13 @@ fn run_time_sorted_query_all_segments(
     schema: &Schema,
     spec: &QuerySpec,
     limit: usize,
+    range_query_impl: &str,
+    auto_term_cap: u64,
 ) -> tantivy::Result<Vec<(i64, u64, tantivy::DocAddress)>> {
     info!("=== Time-Sorted Query Execution (All Segments) ===");
     
     // 构建查询
-    let query = build_common_query(schema, spec);
+    let query = build_common_query(searcher, schema, spec, range_query_impl, auto_term_cap);
     let executor = SegmentQueryExecutor::new(Box::new(query), "timestamp".to_string(), limit);
     
     // 获取所有segment readers
@@ -542,16 +1092,6 @@ fn run_time_sorted_query_all_segments(
         
         all_results.push((timestamp, tenant_id, doc_addr));
     }
-    // info!("before Global early termination: truncated to {} results", all_results.len());
-
-    // 按时间降序排序最终结果
-    // all_results.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-    
-    // // 应用全局早停：如果已经收集到足够的结果，截断到limit
-    // if all_results.len() > limit {
-    //     all_results.truncate(limit);
-    //     info!("Global early termination: truncated to {} results", all_results.len());
-    // }
     
     info!("Time-sorted query completed: {} results", all_results.len());
     Ok(all_results)
@@ -562,11 +1102,13 @@ fn run_time_sorted_query_segment_by_segment(
     schema: &Schema,
     spec: &QuerySpec,
     limit: usize,
+    range_query_impl: &str,
+    auto_term_cap: u64,
 ) -> tantivy::Result<Vec<(i64, u64, tantivy::DocAddress)>> {
     info!("=== Time-Sorted Query Execution (Segment by Segment) ===");
     
     // 构建查询
-    let query = build_common_query(schema, spec);
+    let query = build_common_query(searcher, schema, spec, range_query_impl, auto_term_cap);
     let executor = SegmentQueryExecutor::new(Box::new(query), "timestamp".to_string(), limit);
     
     let mut all_results: Vec<(i64, u64, tantivy::DocAddress)> = Vec::new();
@@ -609,20 +1151,20 @@ fn run_time_sorted_query_segment_by_segment(
 }
 
 
-fn run_traditional_queries(index_path: &str) -> tantivy::Result<()> {
+fn run_traditional_queries(index_path: &str, range_query_impl: &str, auto_term_cap: u64) -> tantivy::Result<()> {
     let (_index, searcher, schema) = load_index_and_validate(index_path, "traditional")?;
     
     // 运行查询规格
     println!("\n=== Running Traditional Queries ===");
     let spec = create_default_query_spec();
     
-    // 运行通用查询测试
-    run_common_query_tests(&searcher, &schema, &spec)?;
+    // 运行通用查询测试（使用默认阈值打印分析信息）
+    run_common_query_tests(&searcher, &schema, &spec, range_query_impl)?;
     
     // 传统查询测试 - 使用真正的Top-100查询
     println!("\n--- Traditional Query Test ---");
     let start = Instant::now();
-    let query = build_common_query(&schema, &spec);
+    let query = build_common_query(&searcher, &schema, &spec, range_query_impl, auto_term_cap);
     let collector = TopDocs::with_limit(100).order_by_fast_field("timestamp", Order::Desc);
     let top_docs: Vec<(i64, tantivy::DocAddress)> = searcher.search(&query, &collector)?;
     
@@ -646,15 +1188,15 @@ fn run_traditional_queries(index_path: &str) -> tantivy::Result<()> {
     Ok(())
 }
 
-fn run_time_sorted_queries(index_path: &str, query_method: &str) -> tantivy::Result<()> {
+fn run_time_sorted_queries(index_path: &str, query_method: &str, range_query_impl: &str, auto_term_cap: u64) -> tantivy::Result<()> {
     let (_index, searcher, schema) = load_index_and_validate(index_path, "time-sorted")?;
     
     // 运行查询规格
     println!("\n=== Running Time-Sorted Queries (Method: {}) ===", query_method);
     let spec = create_default_query_spec();
     
-    // 运行通用查询测试
-    run_common_query_tests(&searcher, &schema, &spec)?;
+    // 运行通用查询测试（使用默认阈值打印分析信息）
+    run_common_query_tests(&searcher, &schema, &spec, range_query_impl)?;
     
     // 时间排序查询测试
     println!("\n--- Time-Sorted Query Test ---");
@@ -663,11 +1205,11 @@ fn run_time_sorted_queries(index_path: &str, query_method: &str) -> tantivy::Res
     let time_sorted_results = match query_method {
         "all_segments" => {
             println!("Using execute_on_segments method");
-            run_time_sorted_query_all_segments(&searcher, &schema, &spec, 100)?
+            run_time_sorted_query_all_segments(&searcher, &schema, &spec, 100, range_query_impl, auto_term_cap)?
         }
         "segment_by_segment" => {
             println!("Using execute_on_segment method (segment by segment)");
-            run_time_sorted_query_segment_by_segment(&searcher, &schema, &spec, 100)?
+            run_time_sorted_query_segment_by_segment(&searcher, &schema, &spec, 100, range_query_impl, auto_term_cap)?
         }
         _ => {
             eprintln!("Error: Invalid query method '{}'. Use 'all_segments' or 'segment_by_segment'", query_method);
@@ -735,10 +1277,10 @@ fn main() -> tantivy::Result<()> {
             
             match args.index_type.as_str() {
                 "traditional" => {
-                    run_traditional_queries(&index_path)?;
+                    run_traditional_queries(&index_path, &args.range_query_impl, args.auto_term_cap)?;
                 }
                 "time_sorted" => {
-                    run_time_sorted_queries(&index_path, &args.query_method)?;
+                    run_time_sorted_queries(&index_path, &args.query_method, &args.range_query_impl, args.auto_term_cap)?;
                 }
                 _ => {
                     error!("Invalid index type: {}", args.index_type);
