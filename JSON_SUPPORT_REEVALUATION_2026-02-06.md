@@ -192,7 +192,21 @@
 
 ---
 
-## 6. 文档自审（第 2 轮 review 结论）
+## 6. 验证状态与注意事项
+
+本次在当前工作树尝试执行过定向验证命令：
+
+- `cargo test json_range_test --lib -- --nocapture`
+
+但执行被当前分支的无关编译错误阻断（`src/collector/top_score_collector.rs` 附近的 `String::try_from(Vec<u8>)` 错误）。因此本文结论以以下证据为主：
+
+1. 当前仓库源码实现。
+2. 当前仓库测试用例与 changelog。
+3. 外部系统官方文档。
+
+---
+
+## 7. 文档自审（第 2 轮 review 结论）
 
 本文件二次自审后，已补齐以下容易遗漏点：
 
@@ -202,7 +216,7 @@
 
 ---
 
-## 7. 参考链接
+## 8. 参考链接
 
 ### Elasticsearch
 
