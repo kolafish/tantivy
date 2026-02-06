@@ -1785,7 +1785,7 @@ mod tests {
                 let term_ord = column.term_ords(doc_address.doc_id).next().unwrap();
                 let mut city = Vec::new();
                 column.dictionary().ord_to_term(term_ord, &mut city).unwrap();
-                (String::try_from(city).unwrap(), doc_address)
+                (String::from_utf8(city).unwrap(), doc_address)
             });
 
             // Using the TopDocs collector should always be equivalent to sorting, skipping the
