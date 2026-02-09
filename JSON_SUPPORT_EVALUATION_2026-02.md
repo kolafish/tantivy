@@ -49,7 +49,7 @@ Doris 的 `VARIANT` 类型（2.1+）是当前业界最接近"理想 JSON 列式�
 
 **索引支持**：ZoneMap（min/max 裁剪）、BloomFilter、倒排索引（对文本支持分词、对数值使用 BKD Tree、posting list 用 Roaring Bitmap 压缩）。3.1+ 支持按 path 配置不同索引策略。
 
-**性能数据**：VARIANT 查询比 JSON(JSONB) 快 8x，存储节省 65%；比 ES 约快 2x，存储节省 80%。
+**性能数据**（厂商 benchmark，仅供参考）：VARIANT 查询比 JSON(JSONB) 快 8x，存储节省 65%；比 ES 约快 2x，存储节省 80%。
 
 **已知限制**：不能作为主键/排序键；Schema Template 不可 ALTER 修改；全列读取（SELECT *）时需扫描所有子列；类型冲突退化为 JSONB 后性能下降。
 
@@ -261,6 +261,15 @@ let date_field = schema_builder.add_date_field("sort_release_date", FAST);
 
 查询时路由：当 `ORDER BY data->>'$.price'` 时，router 识别为白名单字段，使用 `sort_price` 进行排序而非从 JSON 动态列提取。
 
+> **参考实现**：`examples/json_native_whitelist_demo.rs` 已演示了这一模式（原生 JSON + 白名单字段的组合），可作为实现起点。
+
+#### 双写一致性与存储开销
+
+白名单增强层本质是双写：同一个值同时写入原生 JSON field 和独立 typed field。这意味着：
+- **存储开销**：白名单字段的数据会被存储两份（一份在 JSON 动态列，一份在独立 fast field）。对于少量热路径（通常 < 10 个），开销可控
+- **写入一致性**：双写发生在同一个 `IndexWriter::add_document()` 调用中，由 Tantivy 的 segment commit 保证原子性，无需额外的一致性机制
+- **查询语义**：router 需确保对白名单路径的查询只走一个路径（增强层或原生层），避免重复计分
+
 ### 4.4 类型治理层
 
 ```json
@@ -367,6 +376,7 @@ LIMIT 20;
 1. **非白名单路径的排序**：只能通过 JSON 动态列获取，性能不如独立 fast field。需在文档和 SLA 中明确
 2. **高基数动态路径**：如果 JSON 有上千个不同 path，动态列的元数据开销会增加。需参考上游 `#2694`（ExistsQuery 动态列优化）的经验
 3. **类型冲突**：同一 path 在不同文档中有不同类型时，原生 JSON 会按实际类型索引。range query 只匹配对应类型的文档，不做自动类型转换
+4. **白名单双写开销**：白名单路径数据存储两份。如果白名单路径过多（> 20），存储和写入放大可能显著。建议控制白名单在 10 个以内
 
 ### 6.3 与上游的同步策略
 
