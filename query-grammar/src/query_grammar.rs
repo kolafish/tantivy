@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::iter::once;
 
+use fnv::FnvHashSet;
 use nom::IResult;
 use nom::branch::alt;
 use nom::bytes::complete::tag;
@@ -68,7 +69,7 @@ fn interpret_escape(source: &str) -> String {
 
 /// Consume a word outside of any context.
 // TODO should support escape sequences
-fn word(inp: &str) -> IResult<&str, Cow<str>> {
+fn word(inp: &str) -> IResult<&str, Cow<'_, str>> {
     map_res(
         recognize(tuple((
             alt((
@@ -305,15 +306,14 @@ fn term_group_infallible(inp: &str) -> JResult<&str, UserInputAst> {
     let (inp, (field_name, _, _, _)) =
         tuple((field_name, multispace0, char('('), multispace0))(inp).expect("precondition failed");
 
-    let res = delimited_infallible(
+    delimited_infallible(
         nothing,
         map(ast_infallible, |(mut ast, errors)| {
             ast.set_default_field(field_name.to_string());
             (ast, errors)
         }),
         opt_i_err(char(')'), "expected ')'"),
-    )(inp);
-    res
+    )(inp)
 }
 
 fn exists(inp: &str) -> IResult<&str, UserInputLeaf> {
@@ -560,7 +560,7 @@ fn range_infallible(inp: &str) -> JResult<&str, UserInputLeaf> {
             (
                 (
                     value((), tag(">=")),
-                    map(word_infallible("", false), |(bound, err)| {
+                    map(word_infallible(")", false), |(bound, err)| {
                         (
                             (
                                 bound
@@ -574,7 +574,7 @@ fn range_infallible(inp: &str) -> JResult<&str, UserInputLeaf> {
                 ),
                 (
                     value((), tag("<=")),
-                    map(word_infallible("", false), |(bound, err)| {
+                    map(word_infallible(")", false), |(bound, err)| {
                         (
                             (
                                 UserInputBound::Unbounded,
@@ -588,7 +588,7 @@ fn range_infallible(inp: &str) -> JResult<&str, UserInputLeaf> {
                 ),
                 (
                     value((), tag(">")),
-                    map(word_infallible("", false), |(bound, err)| {
+                    map(word_infallible(")", false), |(bound, err)| {
                         (
                             (
                                 bound
@@ -602,7 +602,7 @@ fn range_infallible(inp: &str) -> JResult<&str, UserInputLeaf> {
                 ),
                 (
                     value((), tag("<")),
-                    map(word_infallible("", false), |(bound, err)| {
+                    map(word_infallible(")", false), |(bound, err)| {
                         (
                             (
                                 UserInputBound::Unbounded,
@@ -758,7 +758,17 @@ fn negate(expr: UserInputAst) -> UserInputAst {
 fn leaf(inp: &str) -> IResult<&str, UserInputAst> {
     alt((
         delimited(char('('), ast, char(')')),
-        map(char('*'), |_| UserInputAst::from(UserInputLeaf::All)),
+        map(
+            terminated(
+                char('*'),
+                peek(alt((
+                    value((), multispace1),
+                    value((), char(')')),
+                    value((), eof),
+                ))),
+            ),
+            |_| UserInputAst::from(UserInputLeaf::All),
+        ),
         map(preceded(tuple((tag("NOT"), multispace1)), leaf), negate),
         literal,
     ))(inp)
@@ -779,7 +789,17 @@ fn leaf_infallible(inp: &str) -> JResult<&str, Option<UserInputAst>> {
                 ),
             ),
             (
-                value((), char('*')),
+                value(
+                    (),
+                    terminated(
+                        char('*'),
+                        peek(alt((
+                            value((), multispace1),
+                            value((), char(')')),
+                            value((), eof),
+                        ))),
+                    ),
+                ),
                 map(nothing, |_| {
                     (Some(UserInputAst::from(UserInputLeaf::All)), Vec::new())
                 }),
@@ -815,7 +835,7 @@ fn boosted_leaf(inp: &str) -> IResult<&str, UserInputAst> {
         tuple((leaf, fallible(boost))),
         |(leaf, boost_opt)| match boost_opt {
             Some(boost) if (boost - 1.0).abs() > f64::EPSILON => {
-                UserInputAst::Boost(Box::new(leaf), boost)
+                UserInputAst::Boost(Box::new(leaf), boost.into())
             }
             _ => leaf,
         },
@@ -827,7 +847,7 @@ fn boosted_leaf_infallible(inp: &str) -> JResult<&str, Option<UserInputAst>> {
         tuple_infallible((leaf_infallible, boost)),
         |((leaf, boost_opt), error)| match boost_opt {
             Some(boost) if (boost - 1.0).abs() > f64::EPSILON => (
-                leaf.map(|leaf| UserInputAst::Boost(Box::new(leaf), boost)),
+                leaf.map(|leaf| UserInputAst::Boost(Box::new(leaf), boost.into())),
                 error,
             ),
             _ => (leaf, error),
@@ -1078,12 +1098,25 @@ pub fn parse_to_ast_lenient(query_str: &str) -> (UserInputAst, Vec<LenientError>
     (rewrite_ast(res), errors)
 }
 
-/// Removes unnecessary children clauses in AST
-///
-/// Motivated by [issue #1433](https://github.com/quickwit-oss/tantivy/issues/1433)
 fn rewrite_ast(mut input: UserInputAst) -> UserInputAst {
-    if let UserInputAst::Clause(terms) = &mut input {
-        for term in terms {
+    if let UserInputAst::Clause(sub_clauses) = &mut input {
+        // call rewrite_ast recursively on children clauses if applicable
+        let mut new_clauses = Vec::with_capacity(sub_clauses.len());
+        for (occur, clause) in sub_clauses.drain(..) {
+            let rewritten_clause = rewrite_ast(clause);
+            new_clauses.push((occur, rewritten_clause));
+        }
+        *sub_clauses = new_clauses;
+
+        // remove duplicate child clauses
+        // e.g. (+a +b) OR (+c +d) OR (+a +b)  => (+a +b) OR (+c +d)
+        let mut seen = FnvHashSet::default();
+        sub_clauses.retain(|term| seen.insert(term.clone()));
+
+        // Removes unnecessary children clauses in AST
+        //
+        // Motivated by [issue #1433](https://github.com/quickwit-oss/tantivy/issues/1433)
+        for term in sub_clauses {
             rewrite_ast_clause(term);
         }
     }
@@ -1290,6 +1323,14 @@ mod test {
         test_parse_query_to_ast_helper("<a", "{\"*\" TO \"a\"}");
         test_parse_query_to_ast_helper("<=a", "{\"*\" TO \"a\"]");
         test_parse_query_to_ast_helper("<=bsd", "{\"*\" TO \"bsd\"]");
+
+        test_parse_query_to_ast_helper("(<=42)", "{\"*\" TO \"42\"]");
+        test_parse_query_to_ast_helper("(<=42 )", "{\"*\" TO \"42\"]");
+        test_parse_query_to_ast_helper("(age:>5)", "\"age\":{\"5\" TO \"*\"}");
+        test_parse_query_to_ast_helper(
+            "(title:bar AND age:>12)",
+            "(+\"title\":bar +\"age\":{\"12\" TO \"*\"})",
+        );
     }
 
     #[test]
@@ -1658,6 +1699,21 @@ mod test {
         test_parse_query_to_ast_helper("abc:a b", "(*\"abc\":a *b)");
         test_parse_query_to_ast_helper("abc:\"a b\"", "\"abc\":\"a b\"");
         test_parse_query_to_ast_helper("foo:[1 TO 5]", "\"foo\":[\"1\" TO \"5\"]");
+
+        // Phrase prefixed with *
+        test_parse_query_to_ast_helper("foo:(*A)", "\"foo\":*A");
+        test_parse_query_to_ast_helper("*A", "*A");
+        test_parse_query_to_ast_helper("(*A)", "*A");
+        test_parse_query_to_ast_helper("foo:(A OR B)", "(?\"foo\":A ?\"foo\":B)");
+        test_parse_query_to_ast_helper("foo:(A* OR B*)", "(?\"foo\":A* ?\"foo\":B*)");
+        test_parse_query_to_ast_helper("foo:(*A OR *B)", "(?\"foo\":*A ?\"foo\":*B)");
+    }
+
+    #[test]
+    fn test_parse_query_all() {
+        test_parse_query_to_ast_helper("*", "*");
+        test_parse_query_to_ast_helper("(*)", "*");
+        test_parse_query_to_ast_helper("(* )", "*");
     }
 
     #[test]
