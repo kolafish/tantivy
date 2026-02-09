@@ -39,7 +39,9 @@ fi
 
 if [ "$MODE" = "query" ] || [ "$MODE" = "both" ]; then
   echo "Step 2: Running performance queries..."
-  cargo run --example multi_field_performance_test -- --mode query --index-path "$INDEX_DIR"
+  export RUST_LOG=DEBUG
+  RUST_LOG=tantivy=debug cargo run --example multi_field_performance_test -- --mode query --index-path "$INDEX_DIR"
+  # cargo run --example multi_field_performance_test -- --mode query --index-path "$INDEX_DIR"
   if [ $? -eq 0 ]; then
       echo "Queries completed successfully!"
       echo

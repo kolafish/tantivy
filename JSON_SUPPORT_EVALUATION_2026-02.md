@@ -14,7 +14,7 @@
 | **白名单增强层** | 热路径的 analyzer 定制 + 排序 | 对声明的路径抽取为独立 typed field |
 | **类型治理层** | schema 约束 + 写入校验 | path→type 注册表，写入时软/硬校验 |
 
-核心依据：Tantivy 0.24+ 已补齐 JSON fast field range、path 级动态列、JSON 聚合等能力，半年前方案中关于"原生 JSON 不支持 range/排序"的若干判断已过时。自定义 fixed layer 的维护成本远大于收益。
+核心依据：Tantivy 0.24+ 已补齐 JSON fast field range、path 级动态列、JSON 聚合等能力；0.25/0.26 进一步优化了 ExistsQuery 动态列性能、新增 fast field fallback、seek_exact 交集优化等。半年前方案中关于"原生 JSON 不支持 range/排序"的若干判断已过时。自定义 fixed layer 的维护成本远大于收益。
 
 ---
 
@@ -24,30 +24,31 @@
 
 ES 提供四种 JSON 处理策略，每种有不同的权衡：
 
-**Object（默认）**：将 JSON 扁平化为 dot-path 独立字段。每个路径有独立倒排索引、doc values、stored fields。**核心缺陷**：数组对象的跨字段关联丢失——`user.first=alice AND user.last=smith` 会错误匹配 `[{first:alice, last:white}, {first:john, last:smith}]`。
+**Object（默认）**：将 JSON 扁平化为 dot-path 独立字段。每个路径有独立倒排索引、doc values、stored fields。**核心缺陷**：数组对象的跨字段关联丢失——`user.first=alice AND user.last=smith` 会错误匹配 `[{first:alice, last:white}, {first:john, last:smith}]`。这是因为扁平化后 `user.first` 和 `user.last` 各自成为独立的多值字段，失去了同一对象内的关联关系。实际生产中，大多数 ES 用户使用此模式，因为它是最轻量的默认选择，但在处理数组嵌套对象时必须清楚其语义陷阱。
 
-**Nested**：每个嵌套对象作为独立 Lucene 文档存储，通过 `ToParentBlockJoinQuery` 实现索引时 join。**保留了数组内对象的字段关联**，但代价显著：每个嵌套对象 = 1 个 Lucene 文档；默认限制 50 个 nested mapping / 10000 个嵌套对象；更新任一嵌套字段需重新索引整个父文档。
+**Nested**：每个嵌套对象作为独立 Lucene 文档存储，通过 `ToParentBlockJoinQuery` 实现索引时 join。**保留了数组内对象的字段关联**，但代价显著：每个嵌套对象 = 1 个 Lucene 文档；默认限制 50 个 nested mapping / 10000 个嵌套对象；更新任一嵌套字段需重新索引整个父文档。其底层实现依赖 Lucene 的 block indexing：父文档和所有子文档在同一个 segment 中按连续 doc ID 排列，查询时通过 `ToParentBlockJoinQuery` 定位子文档并向上 join 到父文档。这使得 nested query 的性能远低于普通 query（通常 3-5x 的开销），且更新成本极高。
 
-**Flattened**：所有叶子 key-value 放入单个 Lucene 字段，token 格式为 `key\0value`。**解决 mapping 爆炸问题**（ES 默认 1000 字段限制），但所有值按 keyword 处理——不支持数值 range、不支持全文检索、不支持 highlight。
+**Flattened**：所有叶子 key-value 放入单个 Lucene 字段，token 格式为 `key\0value`。**解决 mapping 爆炸问题**（ES 默认 1000 字段限制），但所有值按 keyword 处理——不支持数值 range、不支持全文检索、不支持 highlight。适用于高基数 key 的日志/标签场景（如 Kubernetes labels），用户愿意牺牲查询能力换取 mapping 稳定性。
 
-**subobjects:false（ES 8.x 新增）**：dot-path key 作为字面字段名，但保留正确类型（不像 flattened 全部 keyword 化）。是 object 和 flattened 之间的折中。
+**subobjects:false（ES 8.x 新增）**：dot-path key 作为字面字段名，但保留正确类型（不像 flattened 全部 keyword 化）。是 object 和 flattened 之间的折中。实际上是告诉 ES "不要自动将 dot-path 展开为嵌套对象"，从而让 `a.b.c` 作为一个平坦的字段名存在，同时保留该字段的原始类型映射（数值仍可 range、文本仍可全文检索）。
 
 **对 Tantivy 的启发**：
 - ES 的主流实践本质是"路径治理 + 类型治理 + 热字段显式建模"，不是完全自由的 schemaless
 - mapping 爆炸问题在 Tantivy（嵌入式库）中不如 ES（分布式集群）严重，但数组对象关联丢失和 query 灵活性 vs 存储成本的权衡同样适用
 - nested 语义需要 Lucene 的 block join 基础设施，Tantivy 需从零实现，短期不现实
+- ES 的 flattened 类型与 Tantivy 半年前的 fixed layer 思路类似——都是将 JSON 压入单一字段以控制 schema 爆炸，但都牺牲了类型感知的查询能力
 
 ### 1.2 Apache Doris
 
 Doris 的 `VARIANT` 类型（2.1+）是当前业界最接近"理想 JSON 列式存储"的实现：
 
-**核心机制**：写入时自动将 JSON 拆解为独立列式子列（sub-columns）。每个 JSON path 成为一个原生列，享受与静态列相同的编码（字典、RLE 等）、压缩和索引。
+**核心机制**：写入时自动将 JSON 拆解为独立列式子列（sub-columns）。每个 JSON path 成为一个原生列，享受与静态列相同的编码（字典、RLE 等）、压缩和索引。其核心思路是"写入时付出拆解成本，查询时获得列式存储的全部收益"。具体流程：JSON 文档 → Memtable 中按 path 拆解 → flush 时每个 path 写为独立列文件 → compaction 时合并同 path 列。这与 Tantivy 的 JSON fast field 动态列机制高度相似。
 
-**类型推断与合并**：在 Memtable flush 时构建前缀树，追踪每个 path 的类型。冲突时做"最小公共类型"合并（如 TinyInt + BigInt → BigInt），无法调和时退化为 JSONB 二进制存储。
+**类型推断与合并**：在 Memtable flush 时构建前缀树，追踪每个 path 的类型。冲突时做"最小公共类型"（Least Common Type, LCT）合并（如 TinyInt + BigInt → BigInt, Int + Float → Double），无法调和时退化为 JSONB 二进制存储。LCT 策略的优势是简单可预测，但缺点是一旦出现类型冲突，可能将本来高效的整数列"拉升"到浮点列，或直接退化为 JSONB。
 
-**稀疏列处理**：NULL 比例高的低频 path 不独立建列，而是打包进共享 JSONB 列（`variant_max_subcolumns_count` 默认 2048）。防止"列爆炸"。
+**稀疏列处理**：NULL 比例高的低频 path 不独立建列，而是打包进共享 JSONB 列（`variant_max_subcolumns_count` 默认 2048）。防止"列爆炸"。这意味着 Doris 对"高频路径独立列 + 低频路径共享列"的分层存储是自动的、透明的，用户无需显式配置。
 
-**索引支持**：ZoneMap（min/max 裁剪）、BloomFilter、倒排索引（对文本支持分词、对数值使用 BKD Tree、posting list 用 Roaring Bitmap 压缩）。3.1+ 支持按 path 配置不同索引策略。
+**索引支持**：ZoneMap（min/max 裁剪）、BloomFilter、倒排索引（对文本支持分词、对数值使用 BKD Tree、posting list 用 Roaring Bitmap 压缩）。3.1+ 支持按 path 配置不同索引策略。值得注意的是，Doris 的倒排索引是后置的（单独建在子列上），而非像 ES/Tantivy 一样在写入时同步构建，因此索引创建和数据写入是解耦的。
 
 **性能数据**（厂商 benchmark，仅供参考）：VARIANT 查询比 JSON(JSONB) 快 8x，存储节省 65%；比 ES 约快 2x，存储节省 80%。
 
@@ -57,26 +58,28 @@ Doris 的 `VARIANT` 类型（2.1+）是当前业界最接近"理想 JSON 列式�
 - 写入时拆列是性能的核心——Tantivy 的 JSON fast field 已实现 path 级动态列，思路一致
 - 稀疏路径治理（热路径独立列 + 冷路径共享存储）是必须解决的工程问题
 - 倒排索引 + 列式存储的结合正是 Tantivy 的天然优势
+- Doris 的自动拆列 vs Tantivy 的白名单声明：前者对用户更透明，后者更可控、可预测
 
 ### 1.3 ClickHouse
 
 ClickHouse 新 JSON 类型（v24.8 引入，v25.3 production-ready）是最复杂也最灵活的实现：
 
-**核心创新——Variant/Dynamic 类型**：不做类型合并，而是用 discriminated union 保留每行的原始类型。一个 path 可以同时在不同行存储 Int64、String、Array，各自有独立子列文件。UInt8 discriminator 标识每行的实际类型。
+**核心创新——Variant/Dynamic 类型**：不做类型合并，而是用 discriminated union 保留每行的原始类型。一个 path 可以同时在不同行存储 Int64、String、Array，各自有独立子列文件。UInt8 discriminator 标识每行的实际类型。这与 Doris 的 LCT 合并策略形成鲜明对比：ClickHouse 选择"保留原始类型信息，查询时按类型分发"，避免了类型合并导致的精度损失，但代价是每次访问都需要先检查 discriminator。
 
 **三级存储**：
-1. **Typed Paths**（schema 声明）：与原生列性能相同，零 overhead
-2. **Dynamic Paths**（自动推断，默认 max 1024）：Dynamic 类型子列，近原生性能
-3. **Shared Data**（溢出）：Map(String,String) 结构存储低频 path
+1. **Typed Paths**（schema 声明）：与原生列性能相同，零 overhead。用户可通过 DDL 预声明已知路径的类型，类似于 Tantivy 白名单方案中的 `sortable_fields`
+2. **Dynamic Paths**（自动推断，默认 max 1024）：Dynamic 类型子列，近原生性能。超出 `max_dynamic_paths` 限制后自动降级到 Shared Data
+3. **Shared Data**（溢出）：Map(String,String) 结构存储低频 path。旧格式需要全量读取，性能较差
 
-**v25.8 advanced format**：对 shared data 引入 granule 级元数据，选择性读取比旧格式快 58x、内存减少 3300x。
+**v25.8 advanced format**：对 shared data 引入 granule 级元数据，选择性读取比旧格式快 58x、内存减少 3300x。这一优化的核心是在每个 granule（通常 8192 行）上记录该 granule 包含哪些 path，查询时可以跳过不包含目标 path 的 granule，避免全量扫描。
 
-**已知限制**：无法作为主键；NULL 无法区分"值为 null"和"path 不存在"；path 扁平化歧义（`a.b.c` 无法区分嵌套 vs 带点 key）；不支持 JSON 子列上的倒排索引（roadmap 中）。
+**已知限制**：无法作为主键；NULL 无法区分"值为 null"和"path 不存在"（Tantivy 同样存在此问题）；path 扁平化歧义（`a.b.c` 无法区分嵌套 vs 带点 key，Tantivy 通过 `expand_dots_enabled` 选项处理此歧义）；不支持 JSON 子列上的倒排索引（roadmap 中）。
 
 **对 Tantivy 的启发**：
 - 类型保留（Variant）vs 类型合并（Doris LCT）是核心设计选择——对搜索引擎而言，倒排索引天然是类型相关的，path 级类型治理比 Variant 更实用
 - 热路径提升 + 冷路径共享是三个系统的共识
 - **ClickHouse 不支持 JSON 子列的倒排索引**——这恰恰是 Tantivy 的核心竞争力所在
+- ClickHouse 的 Typed Paths 机制验证了"预声明热路径"的思路，与我们的白名单设计方向一致
 
 ### 1.4 三系统对比总结
 
@@ -93,40 +96,90 @@ ClickHouse 新 JSON 类型（v24.8 引入，v25.3 production-ready）是最复�
 
 ---
 
-## 2. Tantivy 原生 JSON 能力现状（v0.25）
+## 2. Tantivy 原生 JSON 能力现状（v0.26）
+
+> 已合并 upstream/main 最新代码（截至 2026-02-09，commit `28db95213`）。当前版本 `0.26.0`（开发中）。
 
 ### 2.1 已具备能力
 
-| 能力 | 状态 | 代码位置 |
-|---|---|---|
-| JSON fast field range query | 0.24 引入 | `src/query/range_query/range_query_fastfield.rs` |
-| JSON path 的 QueryParser 语法 + 类型推断 | 支持 | `src/query/query_parser/query_parser.rs` |
-| JSON fast field 按 path 列式访问 | 支持 | `src/fastfield/readers.rs`（动态列） |
-| JSON path 参与聚合 | 支持 | `src/aggregation/agg_tests.rs` |
-| JSON path exists 查询 | 支持 | `src/query/exist_query.rs` |
-| JSON path term/fulltext 查询 | 支持 | 原生能力 |
+| 能力 | 引入版本 | 代码位置 | 说明 |
+|---|---|---|---|
+| JSON fast field range query | 0.24 | `src/query/range_query/range_query_fastfield.rs` | 支持 U64/I64/F64/Date/Str，含跨数值类型自动转换 |
+| JSON path QueryParser 语法 + 类型推断 | 0.22 | `src/query/query_parser/query_parser.rs` | `data.price:[10 TO 100]` 语法 |
+| JSON fast field 按 path 列式访问 | 0.22 | `src/fastfield/readers.rs` | `dynamic_column_handles()` + `dynamic_subpath_column_handles()` |
+| JSON path 参与聚合 | 0.22 | `src/aggregation/` | term/histogram/range/stats/cardinality/filter 聚合均支持 JSON path |
+| JSON path exists 查询（含子路径联合） | 0.24 | `src/query/exist_query.rs` | `json_subpaths=true` 时匹配任意子路径 |
+| JSON path term/fulltext 查询 | 0.22 | 原生能力 | 支持 phrase query + BM25 scoring |
+| JSON root level 支持非 object 值 | 0.24 | `src/core/json_utils.rs` | 标量值/数组可直接作为 JSON field 的根 |
+| Fast field fallback for term query | 0.25+ | `#2693` | 字段未建倒排索引时自动回退到 fast field 查询 |
+| ExistsQuery 高动态列数优化 | 0.25+ | `#2694` | ≥4 动态列时使用预计算 BitSet，避免线性扫描 |
+| JSON fields space_usage 统计 | 0.25+ | `#2761` | JSON 字段和 columnar 存储正确计入空间统计 |
+| RangeDocSet 非重叠优化 | 0.25+ | `#2783` | 非重叠 range query 的 DocSet 优化 |
+| 字符串 fast field range query | 0.24 | `#2460` | JSON 内字符串值的字典序 range query |
+| FastFieldRangeQuery 显式 API | 0.24 | `#2477` | 直接指定 fast field range，跳过自动检测 |
+| Erased SortKeyComputer | 0.25+ | `#2770` | 支持运行时动态类型排序 |
+| TopDocs 字符串 fast field 排序 | 0.25 | `#2642` | `TopDocs::order_by_string_fast_field()` |
+| NoneHighest 自然序排序 | 0.25+ | `#2780` | 排序时空值置顶/置底控制 |
+| Filter 聚合 | 0.25+ | `#2711` | 聚合内子过滤器 |
+| Lazy Scorers | 0.25+ | `#2726` | 延迟 scorer 初始化，减少不必要开销 |
+| seek_exact + cost-based intersection | 0.25+ | `#2538` | posting list 交集优化，大幅提升复合查询性能 |
+| 更快的 exclude query | 0.25+ | `#2825` | NOT 子句查询性能优化 |
 
-### 2.2 仍存在的边界
+### 2.2 JSON 类型支持矩阵
 
-1. **RangeQuery 依赖 fast field**：JSON 的 RangeQuery 当前要求字段标记为 FAST（`src/query/range_query/range_query.rs` 明确报错）
+| 值类型 | 倒排索引 | Fast Field | Range Query | 聚合 | 说明 |
+|---|---|---|---|---|---|
+| String | ✓ | ✓ | ✓（FAST） | ✓ | 通过 term dictionary |
+| I64 | ✓ | ✓ | ✓（FAST） | ✓ | 支持 U64↔I64 自动转换 |
+| U64 | ✓ | ✓ | ✓（FAST） | ✓ | 标准数值类型 |
+| F64 | ✓ | ✓ | ✓（FAST） | ✓ | 索引时做 normalization |
+| Bool | ✓ | ✓ | - | ✓ | range 不支持，term 查询可用 |
+| Date | ✓ | ✓ | ✓（FAST） | ✓ | 查询时 RFC3339 解析 |
+| Null | 跳过 | - | - | - | 索引时忽略 |
+| Array | 递归 | ✓ | - | ✓ | 每个元素独立索引 |
+| Object | 递归 | ✓ | - | ✓ | 按 path 展开索引 |
+| IpAddr / Bytes / Facet | - | - | - | - | **尚未支持** |
+
+### 2.3 仍存在的边界
+
+1. **RangeQuery 依赖 fast field**：JSON 的 RangeQuery 当前要求字段标记为 FAST（`src/query/range_query/range_query.rs:111` 明确报错 `"RangeQuery on JSON is only supported for fast fields currently"`）
 2. **扁平化模型**：数组对象跨对象匹配问题（同 ES object 类型），无 nested 语义
-3. **JSON path 不支持 regex query**
-4. **字段级 tokenizer**：原生 JSON 是整个字段统一 tokenizer，不支持按 path 配置不同 analyzer
-5. **排序**：JSON fast field 是多值动态列，按特定 path 排序需要从动态列中提取对应 path 的值，性能不如独立单值 fast field
+3. **JSON path 不支持 regex query**：`src/query/query_parser/query_parser.rs:882` 明确拒绝（`"Regex query does not support json paths."`）。注意 RegexPhraseQuery（0.24 引入）也不支持 JSON path
+4. **字段级 tokenizer**：原生 JSON 是整个字段统一 tokenizer，不支持按 path 配置不同 analyzer。`JsonObjectOptions` 的 `set_fast()` 可接受 `FastFieldTextOptions` 配置文本 tokenizer，但这是字段级的，不是 path 级的
+5. **排序**：JSON fast field 是多值动态列，按特定 path 排序需要从动态列中提取对应 path 的值，性能不如独立单值 fast field。新增的 `TopDocs::order_by_string_fast_field()`（#2642）和 erased `SortKeyComputer`（#2770）提升了排序灵活性，但不改变 JSON 动态列 vs 独立列的性能差距
+6. **部分值类型不支持**：IpAddr、Bytes、Facet 类型在 JSON 字段内尚未实现（`src/core/json_utils.rs:216-229`）
+7. **expand_dots 歧义**：`expand_dots_enabled=true` 时 `a.b.c` 被展开为嵌套路径，但无法处理 key 本身包含 `.` 的场景，需在查询时转义（`a\.b\.c`）
 
-### 2.3 上游最新变更（落后 93 个 commit）
+### 2.4 已合并的上游变更
 
-当前 fork 基于 `bc1c7898`，upstream/main 已领先 93 个 commit。JSON 相关的上游改进：
+当前已合并 upstream/main（109 个 commit）。以下为 JSON 直接相关或对 JSON 查询有显著影响的上游改进：
 
-- `#2694` Optimize ExistsQuery for a high number of dynamic columns
-- `#2693` Add fast field fallback for term query if not indexed
-- `#2761` Handle JSON fields and columnar in space_usage
-- `#2783` Optimize RangeDocSet for non-overlapping query ranges
-- `#2787` Add benchmark for boolean query with range sub query
-- `#2754` Added some benchmark for top K by a fast field
-- `#2816` Fix closing parenthesis error on elastic range queries
+**JSON 直接相关**：
+- `#2694` Optimize ExistsQuery for a high number of dynamic columns — 动态列 ≥4 时使用 BitSet 代替线性扫描
+- `#2693` Add fast field fallback for term query if not indexed — JSON 字段未建倒排时可回退 fast field
+- `#2761` Handle JSON fields and columnar in space_usage — 修复 JSON 字段空间统计
+- `#2692` Align search float logic to columnar coercion rules — 修复 JSON 浮点数搜索与列式存储的类型对齐
+- `#2816` Fix closing parenthesis error on elastic range queries — 修复 QueryParser 解析错误
 
-**建议**：新建分支从 `upstream/main` 拉取纯净基线，再将 demo/文档迁移过去。当前工作树有大量本地修改和编译错误，不宜直接 merge。
+**查询性能优化（影响 JSON 查询路径）**：
+- `#2538` seek_exact + cost-based intersection — posting list 交集策略优化
+- `#2783` Optimize RangeDocSet for non-overlapping query ranges — range query 性能优化
+- `#2825` faster exclude queries — NOT 子句性能提升
+- `#2698` perf: deduplicate queries — 查询去重优化
+- `#2726` Lazy scorers — 延迟 scorer 初始化
+- `#2745` Optimization when posting list are saturated — 饱和 posting list 优化
+- `#2812` Major bugfix in intersection — 修复交集计算 bug
+
+**聚合增强**：
+- `#2711` feat: added filter aggregation — 新增 filter 聚合
+- `#2717` Add Filtering for Term Aggregations — term 聚合支持过滤
+- `#2740` Optimize term aggregation with low cardinality — 低基数 term 聚合优化
+- `#2759` one collector per agg request instead per bucket — 聚合性能优化
+
+**排序增强**：
+- `#2642` Add string fast field support to TopDocs — 字符串 fast field 排序
+- `#2770` Add erased SortKeyComputer — 运行时动态类型排序
+- `#2780` Add support for natural-order-with-none-highest — 空值排序控制
 
 ---
 
@@ -346,20 +399,53 @@ LIMIT 20;
 
 ---
 
-## 5. 方案对比：新 vs 旧
+## 5. 方案对比
 
-| 维度 | 旧方案（fixed layer） | 新方案（原生 + 白名单） |
-|---|---|---|
-| **Range Query** | 自定义 bytes 编码 + path prefix | 原生 JSON fast field range |
-| **排序** | 自定义 bytes ordinal 排序 | 白名单→独立 fast field |
-| **全文检索** | 自定义 PathPrefixTokenizer | 原生 JSON tokenizer |
-| **Phrase Query** | 不支持 | 原生支持 |
-| **BM25 Scoring** | 不支持 | 原生支持 |
-| **Per-path Analyzer** | 自定义实现 | 白名单增强层 |
-| **嵌套 JSON** | 不支持（仅扁平） | 原生支持任意层级 |
-| **维护成本** | 高（~950 行自定义代码） | 低（薄 routing 层） |
-| **Upstream 兼容** | 差（持续偏离） | 好（依赖原生能力） |
-| **Aggregation** | 不支持 | 原生支持 |
+### 5.1 新方案 vs 旧方案
+
+| 维度 | 旧方案（fixed layer） | 新方案（原生 + 白名单） | 评价 |
+|---|---|---|---|
+| **Range Query** | 自定义 bytes 编码 + path prefix | 原生 JSON fast field range | 原生方案支持类型感知（I64/U64/F64/Date/Str），旧方案需自维护 sign-flip IEEE754 等编码 |
+| **排序** | 自定义 bytes ordinal 排序 | 白名单→独立 fast field | 原生方案利用 Tantivy 标准排序能力（包括新增的 NoneHighest / 字符串排序） |
+| **全文检索** | 自定义 PathPrefixTokenizer | 原生 JSON tokenizer | 原生方案直接复用 Tantivy tokenizer 生态 |
+| **Phrase Query** | 不支持 | 原生支持 | 旧方案因 token 含 path prefix 导致 position 信息失真 |
+| **BM25 Scoring** | 不支持（所有 token 在同一字段，TF/IDF 失真） | 原生支持 | 旧方案的 BM25 score 无业务意义 |
+| **Per-path Analyzer** | 自定义实现（path_configs） | 白名单增强层 | 两者思路相同，新方案用标准 Tantivy field 替代自定义编码 |
+| **嵌套 JSON** | 不支持（仅扁平一层） | 原生支持任意层级 | 旧方案需显式扁平化，丢失结构信息 |
+| **维护成本** | 高（~950 行自定义代码） | 低（薄 routing 层，估计 < 200 行） | 原生方案的 bug 修复/性能优化由上游社区承担 |
+| **Upstream 兼容** | 差（持续偏离，每次 merge 需手动适配） | 好（依赖原生能力，跟随上游升级） | 上游 109 个 commit 中的 JSON 优化，旧方案无法受益 |
+| **Aggregation** | 不支持 | 原生支持（histogram/range/stats/cardinality/filter/term） | 旧方案需从零构建聚合管道 |
+| **Exists Query** | 需自定义实现 | 原生支持（含子路径联合） | 原生方案支持 `json_subpaths=true` |
+| **类型安全** | 弱（全部转为 bytes） | 强（按原始类型索引和查询） | 原生方案的 range query 区分 I64/F64/Str |
+| **存储效率** | 低（path prefix 重复存储、无列式压缩） | 高（动态列式存储 + 列内压缩） | 原生方案享受 columnar 的编码优化 |
+
+### 5.2 新方案 vs 外部系统
+
+以下对比聚焦于"JSON 查询能力"维度，不涉及分布式、事务等数据库层面能力。
+
+| 维度 | Tantivy 新方案 | ES | Doris VARIANT | ClickHouse JSON |
+|---|---|---|---|---|
+| **倒排索引** | 原生全支持（term/phrase/fuzzy/BM25） | 原生全支持 | 支持（BKD + Roaring） | **不支持**（roadmap） |
+| **列式存储** | JSON fast field 动态列 | doc values（每 path 独立） | 自动拆子列 | Variant/Dynamic 子列 |
+| **Range Query** | fast field range（数值/日期/字符串） | 倒排 + doc values | 原生列式 | 原生列式 |
+| **全文检索** | 支持（tokenizer + phrase + BM25） | 全支持 | 支持分词（倒排） | **不支持** |
+| **Phrase Query + BM25** | 支持 | 支持 | 不支持 BM25 | 不支持 |
+| **Aggregation** | 支持（histogram/range/stats/cardinality/filter/term） | 全支持 | 全支持 | 全支持 |
+| **数组对象关联** | 不保留（扁平化） | nested 保留（重） / object 丢失 | 不保留 | 不保留 |
+| **类型冲突处理** | 按实际类型索引，查询时按类型匹配 | dynamic mapping 推断 + 强制 | LCT 合并，JSONB fallback | 保留所有类型（Variant union） |
+| **热路径优化** | 白名单声明（显式） | mapping 声明（显式） | 自动频次提升（隐式） | Typed Paths 声明 + max_dynamic_paths |
+| **Per-path Analyzer** | 白名单增强层（声明式） | mapping 内配置（原生） | 按 path 配索引策略 | N/A（无倒排） |
+| **排序** | 白名单→独立 fast field | doc values | 原生列式 | 原生列式 |
+| **存储模型** | 嵌入式库，单进程 | 分布式集群 | MPP 分布式 OLAP | MPP 分布式 OLAP |
+| **Schema 管理** | 白名单声明 + 类型注册表 | mapping（显式） | Schema Template | DDL Typed Paths |
+| **部署复杂度** | 嵌入式（零运维） | 高（集群管理） | 中（OLAP 集群） | 中（OLAP 集群） |
+
+**关键差异化优势**：
+
+1. **倒排索引 + 列式存储的融合**：Tantivy 是唯一同时提供完整倒排索引和列式存储的嵌入式方案。ClickHouse 有强大的列式存储但无倒排索引；Doris 的倒排索引是后置的，非实时构建
+2. **全文检索能力**：Phrase query + BM25 scoring 是 Tantivy 和 ES 独有的能力，Doris/ClickHouse 作为 OLAP 系统不提供相关性排序
+3. **嵌入式架构**：作为 library 嵌入 TiDB 进程内，避免了网络开销和运维复杂度。ES/Doris/ClickHouse 作为独立服务需要额外的基础设施
+4. **白名单方案的可控性**：相比 Doris 的全自动拆列，白名单声明让用户对索引行为有完全的控制和可预测性，更适合数据库内嵌场景
 
 ---
 
@@ -380,12 +466,11 @@ LIMIT 20;
 
 ### 6.3 与上游的同步策略
 
-当前落后 upstream 93 个 commit，其中包含多个 JSON 相关优化。建议：
+已完成 upstream/main 合并（2026-02-09，109 个 commit，至 `28db95213`），包含全部 JSON 相关优化。后续建议：
 
-1. **不在当前工作树直接 merge**（本地有大量未提交改动和编译错误）
-2. **新建分支**从 `upstream/main` 拉取纯净基线
-3. 将 demo/文档/配置迁移到新分支
-4. 验证原生 JSON 能力在最新代码上的表现
+1. **持续跟踪 upstream**：定期（每 1-2 周）fetch + merge upstream/main，避免再次积累大量差异
+2. **关注 JSON regex 支持**：上游 `#2677` 新增了 regex query grammar，但 JSON path 的 regex 查询仍被显式禁用，后续版本可能放开
+3. **关注 JSON 子列倒排索引**：上游可能参考 ClickHouse roadmap，为 JSON 动态列增加更细粒度的索引控制
 
 ---
 
@@ -393,7 +478,7 @@ LIMIT 20;
 
 ### Phase 1：基础能力验证（1-2 周）
 
-- [ ] 从 `upstream/main` 创建纯净分支
+- [x] 合并 upstream/main 最新代码（109 个 commit，含全部 JSON 优化）
 - [ ] 验证原生 JSON field（TEXT | FAST | STORED）的 range/aggregation/exists 能力
 - [ ] 编写 benchmark：原生 JSON 性能 vs 旧 fixed layer 性能
 - [ ] 更新 `native_json_comparison.rs` 的测试用例
@@ -448,23 +533,43 @@ LIMIT 20;
 
 ### Tantivy 仓库内证据
 
-- `Cargo.toml`（v0.25.0）
-- `CHANGELOG.md`（JSON fast field range 0.24+）
+- `Cargo.toml`（v0.26.0 开发中）
+- `CHANGELOG.md`（JSON fast field range 0.24+，0.25 release notes）
 - `src/query/range_query/range_query.rs` / `range_query_fastfield.rs`
-- `src/fastfield/readers.rs`（动态列访问）
-- `src/aggregation/agg_tests.rs`（JSON aggregation）
-- `src/query/exist_query.rs`（JSON exists）
-- `src/schema/json_object_options.rs`（JSON 字段配置）
-- `src/core/json_utils.rs`（JSON 索引核心逻辑）
+- `src/fastfield/readers.rs`（动态列访问：`dynamic_column_handles()` / `dynamic_subpath_column_handles()`）
+- `src/aggregation/`（JSON aggregation，含 filter aggregation `#2711`）
+- `src/query/exist_query.rs`（JSON exists，含子路径联合 `#2558`）
+- `src/schema/json_object_options.rs`（JSON 字段配置：`set_fast()` / `set_expand_dots_enabled()`）
+- `src/core/json_utils.rs`（JSON 索引核心逻辑：`index_json_value()` / `split_json_path()`）
+- `src/collector/sort_key_top_collector.rs`（erased SortKeyComputer `#2770`）
 - `examples/json_native_whitelist_demo.rs`（白名单 demo）
 - `examples/native_json_comparison.rs`（原生 vs fixed layer 对比）
+- `benches/exists_json.rs`（ExistsQuery 动态列 benchmark）
 - `TiCI_JSON_Support_Proposal.md`（旧 SQL 接口提案）
 - `JSON_ORDER_BY_DESIGN.md`（旧排序设计）
 - `JSON_SUPPORT_REEVALUATION_2026-02-06.md`（上次评估）
 
-### 上游 JSON 相关 PR
+### 上游 JSON 相关 PR（已合并）
 
+**JSON 直接相关**：
 - [#2694 Optimize ExistsQuery for dynamic columns](https://github.com/quickwit-oss/tantivy/pull/2694)
 - [#2693 Add fast field fallback for term query](https://github.com/quickwit-oss/tantivy/pull/2693)
 - [#2761 Handle JSON fields in space_usage](https://github.com/quickwit-oss/tantivy/pull/2761)
+- [#2692 Align search float logic to columnar coercion rules](https://github.com/quickwit-oss/tantivy/pull/2692)
+- [#2816 Fix closing parenthesis error on elastic range queries](https://github.com/quickwit-oss/tantivy/pull/2816)
+
+**查询性能优化**：
+- [#2538 seek_exact + cost-based intersection](https://github.com/quickwit-oss/tantivy/pull/2538)
 - [#2783 Optimize RangeDocSet for non-overlapping ranges](https://github.com/quickwit-oss/tantivy/pull/2783)
+- [#2825 faster exclude queries](https://github.com/quickwit-oss/tantivy/pull/2825)
+- [#2698 perf: deduplicate queries](https://github.com/quickwit-oss/tantivy/pull/2698)
+- [#2726 Lazy scorers](https://github.com/quickwit-oss/tantivy/pull/2726)
+- [#2745 Optimization when posting list are saturated](https://github.com/quickwit-oss/tantivy/pull/2745)
+
+**排序与聚合增强**：
+- [#2642 Add string fast field support to TopDocs](https://github.com/quickwit-oss/tantivy/pull/2642)
+- [#2770 Add erased SortKeyComputer](https://github.com/quickwit-oss/tantivy/pull/2770)
+- [#2780 Add NoneHighest natural-order support](https://github.com/quickwit-oss/tantivy/pull/2780)
+- [#2711 feat: added filter aggregation](https://github.com/quickwit-oss/tantivy/pull/2711)
+- [#2717 Add Filtering for Term Aggregations](https://github.com/quickwit-oss/tantivy/pull/2717)
+- [#2740 Optimize term aggregation with low cardinality](https://github.com/quickwit-oss/tantivy/pull/2740)
